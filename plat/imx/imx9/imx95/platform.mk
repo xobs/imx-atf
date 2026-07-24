@@ -37,6 +37,7 @@ BL31_SOURCES		+=	drivers/arm/css/scmi/scmi_common.c		\
 				plat/imx/imx9/common/plat_topology.c		\
 				plat/imx/common/lpuart_console.S		\
 				plat/imx/imx9/imx95/imx95_bl31_setup.c		\
+				plat/imx/imx9/imx95/imx95_dwc3.c		\
 				plat/imx/imx9/imx95/imx95_m7.c			\
 				plat/imx/imx9/imx95/imx95_lmm.c			\
 				lib/cpus/aarch64/cortex_a55.S			\

@@ -27,6 +27,9 @@
 #include <drivers/arm/gicv3.h>
 #include "../drivers/arm/gic/v3/gicv3_private.h"
 
+#include <bl31/interrupt_mgmt.h>
+#include "imx95_dwc3.h"
+
 #define TRUSTY_PARAMS_LEN_BYTES      (4096*2)
 
 extern void imx9_init_scmi_server();
@@ -40,6 +43,17 @@ static const mmap_region_t imx_mmap[] = {
 	MAP_REGION_FLAT(GPIO2_BASE, 0x20000, MT_DEVICE | MT_RW),
 	MAP_REGION_FLAT(GPIO4_BASE, 0x20000, MT_DEVICE | MT_RW),
 	MAP_REGION_FLAT(ELE_MU_BASE, 0x10000, MT_DEVICE | MT_RW),
+	/* DWC3 USB controller (0x4c100000) + USB PHY CSR (0x4c1f0040). */
+	MAP_REGION_FLAT(0x4c100000, 0x100000, MT_DEVICE | MT_RW),
+	/* DWC3 DMA window (event ring/TRBs/buffers) — cacheable, flushed. */
+	MAP_REGION_FLAT(0x93300000, 0x10000, MT_MEMORY | MT_RW),
+	/*
+	 * EL1<->EL3 console channel rings — non-cacheable AND non-secure, so
+	 * BL31's (EL3/secure) writes land in the same non-secure DRAM view that
+	 * osdyne (EL1/non-secure) reads. Without MT_NS the channel writes go to
+	 * the secure view and osdyne never sees them.
+	 */
+	MAP_REGION_FLAT(0x93380000, 0x10000, MT_NON_CACHEABLE | MT_NS | MT_RW),
 
 	{0},
 };
@@ -145,10 +159,31 @@ void bl31_plat_arch_setup(void)
 	enable_mmu_el3(0);
 }
 
+/*
+ * EL3 FIQ handler for the DWC3 controller (INTID 207, Group-0 secure). Runs the
+ * resident USB console gadget, preempting EL1/EL2 unconditionally.
+ */
+static uint64_t imx95_dwc3_fiq_handler(uint32_t id, uint32_t flags,
+				       void *handle, void *cookie)
+{
+	uint32_t irq = plat_ic_acknowledge_interrupt();
+
+	if (irq == IMX95_DWC3_INTID)
+		imx95_dwc3_service();
+
+	if (irq < 1022U)
+		plat_ic_end_of_interrupt(irq);
+
+	return 0;
+}
+
 void bl31_platform_setup(void)
 {
 	uint32_t gicr_ctlr;
 	uintptr_t gicr_base;
+	uint32_t flags;
+	unsigned int cpu;
+	int rc;
 	int i;
 
 	generic_delay_timer_init();
@@ -182,6 +217,28 @@ void bl31_platform_setup(void)
 	 */
 	write_icc_igrpen1_el3(read_icc_igrpen1_el3() |
 			      IGRPEN1_EL3_ENABLE_G1NS_BIT);
+
+	/*
+	 * Carve the DWC3 controller interrupt (INTID 207) back out of the
+	 * blanket Group1NS routing above and make it a Group-0 secure FIQ to
+	 * EL3, so BL31's resident USB console gadget services it even while
+	 * EL1/EL2 is CPU-bound or hung.
+	 */
+	cpu = plat_my_core_pos();
+	gicv3_set_interrupt_group(IMX95_DWC3_INTID, cpu, INTR_GROUP0);
+	gicv3_set_interrupt_priority(IMX95_DWC3_INTID, cpu,
+				     GIC_HIGHEST_SEC_PRIORITY);
+	gicv3_enable_interrupt(IMX95_DWC3_INTID, cpu);
+
+	flags = 0;
+	set_interrupt_rm_flag(flags, NON_SECURE);
+	rc = register_interrupt_type_handler(INTR_TYPE_EL3,
+					     imx95_dwc3_fiq_handler, flags);
+	if (rc != 0)
+		panic();
+
+	/* Bring up the resident USB console gadget. */
+	imx95_dwc3_gadget_init();
 
 	/* get soc info */
 	ele_get_soc_info();

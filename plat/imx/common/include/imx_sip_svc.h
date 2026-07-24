@@ -10,6 +10,9 @@
 /* SMC function IDs for SiP Service queries */
 #define IMX_SIP_GPC			0xC2000000
 
+/* i.MX95: kick BL31's resident USB console gadget to drain its TX ring. */
+#define IMX_SIP_USB_CONSOLE		0xC2000100
+
 #define IMX_SIP_CPUFREQ			0xC2000001
 #define IMX_SIP_SET_CPUFREQ		0x00
 

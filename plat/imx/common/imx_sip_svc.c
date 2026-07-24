@@ -34,6 +34,14 @@ static uintptr_t imx_sip_handler(unsigned int smc_fid,
 	case IMX_SIP_AARCH32:
 		SMC_RET1(handle, imx_kernel_entry_handler(smc_fid, x1, x2, x3, x4));
 		break;
+#if defined(PLAT_imx95)
+	case IMX_SIP_USB_CONSOLE: {
+		extern void imx95_dwc3_console_kick(void);
+		imx95_dwc3_console_kick();
+		SMC_RET1(handle, 0);
+		break;
+	}
+#endif
 #if defined(PLAT_imx8ulp)
 	case IMX_SIP_SCMI:
 		scmi_smt_fastcall_smc_entry(0);
