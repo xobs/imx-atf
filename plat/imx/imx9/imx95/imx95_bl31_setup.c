@@ -54,6 +54,15 @@ static const mmap_region_t imx_mmap[] = {
 	 * the secure view and osdyne never sees them.
 	 */
 	MAP_REGION_FLAT(0x93380000, 0x10000, MT_NON_CACHEABLE | MT_NS | MT_RW),
+	/*
+	 * Non-secure DRAM windows so the host can peek/poke osdyne's memory via
+	 * BL31's gadget (odd's tasru read/write). Split around the DMA (0x93300000)
+	 * and console-channel (0x93380000) windows mapped above so nothing overlaps.
+	 * Every access is still guarded per-page by xlat_get_mem_attributes(), so
+	 * only mapped ranges are ever touched.
+	 */
+	MAP_REGION_FLAT(0x90000000, 0x03000000, MT_MEMORY | MT_RW | MT_NS),
+	MAP_REGION_FLAT(0x93400000, 0x0CC00000, MT_MEMORY | MT_RW | MT_NS),
 
 	{0},
 };

@@ -20,12 +20,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <arch.h>
 #include <arch_helpers.h>
 #include <common/debug.h>
 #include <drivers/delay_timer.h>
 #include <lib/mmio.h>
+#include <lib/xlat_tables/xlat_tables_v2.h>
 
 #include "imx95_dwc3.h"
 
@@ -139,6 +141,15 @@
 #define MS_OS_STRING_INDEX	0xee
 #define VENDOR_REQ_REBOOT	0x01
 #define REBOOT_MAGIC		0x5253
+/*
+ * Host memory peek/poke (odd's tasru read/write). 32-bit target address is
+ * carried in wValue (addr[31:16]) and wIndex (addr[15:0]); MEM_READ returns the
+ * bytes in the IN data stage, MEM_WRITE takes them in the OUT data stage. Every
+ * access is guarded by mem_range_ok() so an unmapped/invalid address is rejected
+ * (STALL) rather than faulting the secure monitor.
+ */
+#define VENDOR_REQ_MEM_READ	0x02
+#define VENDOR_REQ_MEM_WRITE	0x03
 
 #define EVENT_COUNT	64
 #define EVENT_BYTES	(EVENT_COUNT * 4)
@@ -466,6 +477,10 @@ static bool ep_busy[2];
 static uint32_t ep_rsc[2];
 static bool config_pending;
 static bool reboot_pending;
+/* A validated MEM_WRITE is staged here between its SETUP and its OUT data stage. */
+static bool mem_write_pending;
+static uintptr_t mem_write_addr;
+static uint32_t mem_write_len;
 static bool configured;
 static unsigned int evt_idx;
 
@@ -556,6 +571,75 @@ static uint32_t stage_reply(const uint8_t *src, size_t src_len, uint16_t wlen)
 }
 
 /*
+ * Guard for host memory peek/poke: true only if every page of [addr, addr+len)
+ * is mapped in BL31's own translation tables, so the access cannot fault. When
+ * need_write, the mapping must also be writable. This is what makes an invalid
+ * host request safe — it is rejected (STALL) instead of taking a data abort in
+ * EL3 (which would be fatal).
+ */
+static bool mem_range_ok(uintptr_t addr, uint32_t len, bool need_write)
+{
+	if (len == 0U)
+		return false;
+	if ((addr + len) < addr)	/* wrap-around */
+		return false;
+	for (uintptr_t page = addr & ~0xFFFUL; page < addr + len; page += 0x1000UL) {
+		uint32_t attr;
+
+		if (xlat_get_mem_attributes(page, &attr) != 0)
+			return false;	/* unmapped -> would fault */
+		if (need_write && (attr & MT_RW) == 0U)
+			return false;	/* read-only -> write would fault */
+	}
+	return true;
+}
+
+/*
+ * Read/write a validated target range using the widest naturally-aligned access
+ * for the length, so device registers are touched with a single correctly-sized
+ * access (a byte-at-a-time loop would be wrong for many peripheral registers).
+ */
+static void mem_read_range(uintptr_t addr, uint8_t *dst, uint32_t len)
+{
+	if (len == 4U && (addr & 3U) == 0U) {
+		uint32_t v = mmio_read_32(addr);
+		memcpy(dst, &v, 4);
+	} else if (len == 8U && (addr & 7U) == 0U) {
+		uint64_t v = mmio_read_64(addr);
+		memcpy(dst, &v, 8);
+	} else if (len == 2U && (addr & 1U) == 0U) {
+		uint16_t v = mmio_read_16(addr);
+		memcpy(dst, &v, 2);
+	} else {
+		for (uint32_t i = 0U; i < len; i++)
+			dst[i] = mmio_read_8(addr + i);
+	}
+}
+
+static void mem_write_range(uintptr_t addr, const uint8_t *src, uint32_t len)
+{
+	if (len == 4U && (addr & 3U) == 0U) {
+		uint32_t v;
+
+		memcpy(&v, src, 4);
+		mmio_write_32(addr, v);
+	} else if (len == 8U && (addr & 7U) == 0U) {
+		uint64_t v;
+
+		memcpy(&v, src, 8);
+		mmio_write_64(addr, v);
+	} else if (len == 2U && (addr & 1U) == 0U) {
+		uint16_t v;
+
+		memcpy(&v, src, 2);
+		mmio_write_16(addr, v);
+	} else {
+		for (uint32_t i = 0U; i < len; i++)
+			mmio_write_8(addr + i, src[i]);
+	}
+}
+
+/*
  * Decode a SETUP packet. Returns >= 0 for the data/no-data length (staged in
  * ep0_data), or -1 to STALL.
  */
@@ -627,6 +711,37 @@ static int handle_setup(uint8_t bmreq, uint8_t brequest, uint16_t wvalue,
 			return stage_reply(MS_COMPAT_ID, sizeof(MS_COMPAT_ID), wlen);
 		if (brequest == VENDOR_REQ_REBOOT && wvalue == REBOOT_MAGIC)
 			return 0;
+		if (brequest == VENDOR_REQ_MEM_READ && (bmreq & 0x80U) != 0U) {
+			/* device->host: read [addr, addr+wlen) into ep0_data. */
+			uintptr_t addr = ((uintptr_t)wvalue << 16) | windex;
+			uint32_t n = wlen;
+
+			if (n > sizeof(MEM->ep0_data))
+				n = sizeof(MEM->ep0_data);
+			if (!mem_range_ok(addr, n, false))
+				return -1;
+			mem_read_range(addr, (uint8_t *)MEM->ep0_data, n);
+			dcache_flush((uintptr_t)MEM->ep0_data, n ? n : 1);
+			return (int)n;
+		}
+		if (brequest == VENDOR_REQ_MEM_WRITE && (bmreq & 0x80U) == 0U) {
+			/*
+			 * host->device: validate now (so an invalid request STALLs
+			 * before any data moves); the bytes arrive in the OUT data
+			 * stage and are applied on its completion.
+			 */
+			uintptr_t addr = ((uintptr_t)wvalue << 16) | windex;
+			uint32_t n = wlen;
+
+			if (n == 0U || n > sizeof(MEM->ep0_data))
+				return -1;
+			if (!mem_range_ok(addr, n, true))
+				return -1;
+			mem_write_addr = addr;
+			mem_write_len = n;
+			mem_write_pending = true;
+			return (int)n;
+		}
 		return -1;
 	}
 	return -1;
@@ -657,9 +772,10 @@ static void handle_ep0_xfercomplete(unsigned int ep)
 		wlen = s[6] | (s[7] << 8);
 		ep0_dir_in = (bmreq & 0x80) != 0;
 		ep0_three_stage = wlen != 0;
-		/* New SETUP supersedes any stale EP0_IN in-flight state. */
+		/* New SETUP supersedes any stale EP0_IN / pending-write state. */
 		ep_busy[EP0_IN] = false;
 		ep_rsc[EP0_IN] = 0;
+		mem_write_pending = false;
 
 		n = handle_setup(bmreq, brequest, wvalue, windex, wlen);
 		if (n < 0) {
@@ -689,6 +805,13 @@ static void handle_ep0_xfercomplete(unsigned int ep)
 			ep0_state = EP0_STATE_STATUS_PENDING;
 		}
 	} else if (ep0_state == EP0_STATE_DATA) {
+		/* Apply a validated MEM_WRITE now that its OUT data has landed. */
+		if (mem_write_pending && ep == EP0_OUT) {
+			dcache_flush((uintptr_t)MEM->ep0_data, mem_write_len);
+			mem_write_range(mem_write_addr,
+					(const uint8_t *)MEM->ep0_data, mem_write_len);
+			mem_write_pending = false;
+		}
 		ep0_state = EP0_STATE_STATUS_PENDING;
 	} else if (ep0_state == EP0_STATE_STATUS) {
 		if (reboot_pending)
@@ -740,6 +863,7 @@ static void process_event(uint32_t e)
 			ep0_state = EP0_STATE_SETUP;
 			configured = false;
 			ep1_in_busy = false;
+			mem_write_pending = false;
 			CHAN->configured = 0;
 			break;
 		case DEVT_CONNECTDONE: {
