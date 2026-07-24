@@ -164,6 +164,25 @@ void bl31_platform_setup(void)
 	}
 	plat_gic_init();
 
+	/*
+	 * Route all SPIs (IRQ 32 and above) as non-secure Group 1
+	 * so they are accessible from EL1/EL2 without SMC calls.
+	 * Each GICD_IGROUPR/IGRPMODR register covers 32 interrupts.
+	 * SPIs 32-255 fit in registers 1-7.
+	 */
+	for (i = 1; i <= 7; i++) {
+		mmio_write_32(PLAT_GICD_BASE + GICD_IGROUPR + (i * 4), ~0U);
+		mmio_write_32(PLAT_GICD_BASE + GICD_IGRPMODR + (i * 4), 0U);
+	}
+
+	/*
+	 * Enable Non-secure Group 1 interrupts at the CPU interface.
+	 * gicv3_cpuif_enable() only enables Secure Group 1 (G1S),
+	 * which masks all non-secure SPIs at EL3.
+	 */
+	write_icc_igrpen1_el3(read_icc_igrpen1_el3() |
+			      IGRPEN1_EL3_ENABLE_G1NS_BIT);
+
 	/* get soc info */
 	ele_get_soc_info();
 

@@ -400,7 +400,6 @@ int scmi_per_lpm_mode_set(void *p, uint32_t cpu_id, uint32_t num_configs,
 	unsigned int token = 0;
 	int ret;
 	scmi_channel_t *ch = (scmi_channel_t *)p;
-	struct scmi_per_lpm_config *tmp = cfg;
 
 	validate_scmi_channel(ch);
 
@@ -428,7 +427,6 @@ int scmi_per_lpm_mode_set(void *p, uint32_t cpu_id, uint32_t num_configs,
 
 		if (num_configs > MAX_PER_LPI_CONFIGS_PER_CMD) {
 			num_configs -= MAX_PER_LPI_CONFIGS_PER_CMD;
-			tmp += MAX_PER_LPI_CONFIGS_PER_CMD;
 		} else {
 			break;
 		}
