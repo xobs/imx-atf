@@ -18,6 +18,11 @@ void imx95_dwc3_service(void);
 /* Drain the console TX ring to EP1 IN; call from the IMX_SIP_USB_CONSOLE SMC. */
 void imx95_dwc3_console_kick(void);
 
+/* Soft-disconnect the USB gadget from the bus (clear RUN_STOP) so a reset leaves
+ * USB clean for the next stage's serial-download gadget. Call from every reset
+ * path (see imx_system_reset). Safe if the gadget was never brought up. */
+void imx95_dwc3_disconnect(void);
+
 /* Soft-disconnect USB and PSCI-reset the SoC. Handles the vendor reboot
  * request; usable even when osdyne is frozen. Never returns. */
 void __dead2 imx95_dwc3_do_reboot(void);

@@ -22,6 +22,7 @@
 #include <imx_scmi_client.h>
 #include <plat_imx8.h>
 #include <scmi_imx9.h>
+#include "imx95_dwc3.h"
 
 #define IMR_NUM		U(12)
 #define IMX95_A55P_IDX		6
@@ -747,6 +748,14 @@ void __dead2 imx_pwr_domain_pwr_down_wfi(const psci_power_state_t *target_state)
 void __dead2 imx_system_reset(void)
 {
 	int ret;
+
+	/*
+	 * Soft-disconnect the USB console gadget first so the host sees a clean
+	 * unplug and the serial-download gadget can re-enumerate after the reset
+	 * (covers the UART-triggered reflash reset, which used to be handled by
+	 * osdyne before the gadget moved entirely into BL31).
+	 */
+	imx95_dwc3_disconnect();
 
 	/* TODO: temp workaround for GIC to let reset done */
 	gicd_clr_ctlr(PLAT_GICD_BASE,

@@ -237,6 +237,21 @@ void bl31_platform_setup(void)
 	gicv3_set_interrupt_group(IMX95_DWC3_INTID, cpu, INTR_GROUP0);
 	gicv3_set_interrupt_priority(IMX95_DWC3_INTID, cpu,
 				     GIC_HIGHEST_SEC_PRIORITY);
+
+	/*
+	 * On a warm (SCMI) reset the GIC distributor is NOT reset, so INTID 207
+	 * can be left stuck in the Active state from the previous boot's DWC3
+	 * FIQ. gicv3_distif_init() clears enable/pending but not Active, and the
+	 * GIC never re-delivers an already-Active interrupt — so the console FIQ
+	 * fires on a cold boot but never on a warm one. Clear both Pending and
+	 * Active for 207 before enabling it. (207 is an SPI, so its Active state
+	 * lives in the distributor: GICD_ICACTIVER.)
+	 */
+	gicv3_clear_interrupt_pending(IMX95_DWC3_INTID, cpu);
+	mmio_write_32(PLAT_GICD_BASE + GICD_ICACTIVER +
+			      (IMX95_DWC3_INTID / 32) * 4,
+		      1U << (IMX95_DWC3_INTID % 32));
+
 	gicv3_enable_interrupt(IMX95_DWC3_INTID, cpu);
 
 	flags = 0;

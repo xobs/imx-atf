@@ -84,6 +84,7 @@
 #define GUSB2PHYCFG_ENBLSLPM	(1u << 8)
 #define DCFG_DEVADDR_MASK	(0x7fu << 3)
 #define DSTS_CONNECTSPD		0x7u
+#define DSTS_DEVCTRLHLT		(1u << 22)	/* Device Controller Halted */
 #define GEVNTSIZ_INTMASK	(1u << 31)
 #define DEVTEN_CONN	((1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 6))
 
@@ -481,6 +482,7 @@ static bool reboot_pending;
 static bool mem_write_pending;
 static uintptr_t mem_write_addr;
 static uint32_t mem_write_len;
+
 static bool configured;
 static unsigned int evt_idx;
 
@@ -504,11 +506,19 @@ static void gadget_start(void)
 {
 	uint32_t residual;
 
-	global_init();
+	/*
+	 * Shut down whatever the previous stage left running before we present
+	 * our own gadget. On a cold boot the SPL tears the DWC3 down for us, but
+	 * on a warm reflash it hands us its still-running SDP gadget ("USB Download
+	 * Gadget"); bringing our gadget up on top of that leaves the controller in
+	 * a state where the host never enumerates "osdyne console". Halt the
+	 * controller and power the PHY down here (imx95_dwc3_disconnect), so we
+	 * always start from a clean, powered-down state regardless of how we were
+	 * entered; phy_init() below powers the PHY back up.
+	 */
+	imx95_dwc3_disconnect();
 
-	/* Force a clean disconnect edge before presenting the gadget. */
-	wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
-	mdelay(300);
+	global_init();
 
 	phy_init();
 
@@ -550,8 +560,8 @@ static void gadget_start(void)
 	 */
 	wr(GEVNTSIZ, EVENT_BYTES);
 
-	NOTICE("dwc3(el3): gadget up, gsnpsid=%#x dcfg=%#x dalepena=%#x\n",
-	       rd(GSNPSID), rd(DCFG), rd(DALEPENA));
+	/* NB: TF-A's printf has no '#' flag (it aborts the line) — use "0x%x". */
+	NOTICE("dwc3(el3): gadget up gsnpsid=0x%x\n", rd(GSNPSID));
 }
 
 /* --------------------------------------------------------------- handle_setup */
@@ -958,11 +968,44 @@ void imx95_dwc3_service(void)
 /* Platform PSCI system reset (imx95_psci.c) — SCMI full-reset via the SM. */
 void __dead2 imx_system_reset(void);
 
+void imx95_dwc3_disconnect(void)
+{
+	/*
+	 * Clear RUN_STOP so the controller drops its D+ pull-up: the host sees a
+	 * clean unplug and the next stage's serial-download gadget (SPL SDP / ROM
+	 * SDPS) can enumerate after the reset. osdyne no longer tears the gadget
+	 * down before it resets, and the SPL only does so on a cold boot, so BL31
+	 * must do it on every reset path to cover the warm-reset (reflash) case.
+	 * Safe to call even if the gadget was never brought up — it is just a
+	 * controller register write.
+	 *
+	 * Clearing RUN_STOP only *requests* a halt; we must wait for the
+	 * controller to actually reach the halted state (DSTS.DEVCTRLHLT) before
+	 * continuing, else we act mid-halt.
+	 */
+	wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
+	for (int i = 0; i < 1000000; i++) {
+		if ((rd(DSTS) & DSTS_DEVCTRLHLT) != 0U)
+			break;
+	}
+
+	/*
+	 * Halting the controller isn't enough: the SPL leaves the USB2 PHY
+	 * powered, and the SCMI cold reset doesn't cycle it, so the D+ pull-up
+	 * stays asserted and the ROM's serial-download gadget can't re-enumerate
+	 * after the reset. Power the PHY down — assert its resets and drop the
+	 * reference clock (undo phy_init's REF_SSP_EN) — so the bus is released
+	 * and the ROM re-initialises the PHY from a clean, powered-down state.
+	 */
+	phy_wr(PHY_CTRL1,
+	       phy_rd(PHY_CTRL1) | PHY_CTRL1_RESET | PHY_CTRL1_ATERESET);
+	phy_wr(PHY_CTRL0, phy_rd(PHY_CTRL0) & ~PHY_CTRL0_REF_SSP_EN);
+	mdelay(100);
+}
+
 void __dead2 imx95_dwc3_do_reboot(void)
 {
-	/* Soft-disconnect so the host sees a clean unplug, then reset. */
-	wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
-	mdelay(50);
+	/* imx_system_reset() disconnects the gadget for us before resetting. */
 	imx_system_reset();
 	while (true) {
 	}
@@ -993,6 +1036,18 @@ void imx95_dwc3_gadget_init(void)
 {
 	ep0_state = EP0_STATE_SETUP;
 	evt_idx = 0;
+
+	/*
+	 * Zero the DWC3 DMA structures (event ring, TRBs, setup/EP0/EP1 buffers).
+	 * They live at a fixed DRAM address, not in BL31's BSS, so the C runtime
+	 * never clears them. On a cold boot DDR init leaves DRAM clean, but a warm
+	 * (SCMI) reset retains the previous osdyne's DWC3 state — stale TRBs (with
+	 * HWO set) and event-ring entries — which the controller then acts on and
+	 * enumeration silently fails. Clear + flush to DRAM so the controller
+	 * always starts from a known-good state regardless of how we booted.
+	 */
+	memset((void *)(uintptr_t)MEM, 0, sizeof(struct dwc3_mem));
+	dcache_flush((uintptr_t)MEM, sizeof(struct dwc3_mem));
 
 	/* Initialise the EL1<->EL3 console channel before any traffic. */
 	CHAN->tx_head = 0;
