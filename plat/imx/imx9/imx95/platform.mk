@@ -6,6 +6,11 @@
 
 ENABLE_SCMI_SM := 1
 
+# Route external aborts and SErrors from the non-secure world to EL3 so the
+# debug monitor sees them: a crash in osdyne becomes something inspectable
+# over USB instead of a dead board.
+HANDLE_EA_EL3_FIRST_NS	:=	1
+
 PLAT_INCLUDES		:=	-Iplat/imx/common/include		\
 				-Iplat/imx/imx9/common/include		\
 				-Iplat/imx/imx9/imx95/include		\

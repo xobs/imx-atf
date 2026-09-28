@@ -12,6 +12,19 @@
 
 /* i.MX95: kick BL31's resident USB console gadget to drain its TX ring. */
 #define IMX_SIP_USB_CONSOLE		0xC2000100
+/*
+ * osdyne's own exception vector reports a fault the architecture delivered to
+ * EL1 rather than to EL3 -- a breakpoint, a single step, an undefined
+ * instruction -- and parks in BL31's debug monitor instead of dying, so the
+ * crash stays inspectable over USB.
+ *
+ * x1: (in) ESR_EL1   (out) 1 if the host asked to skip the faulting
+ *                          instruction, 0 to resume where it faulted.
+ *                          osdyne owns ELR_EL1, so osdyne applies it.
+ * x2: (in) FAR_EL1
+ * x3: (in) ELR_EL1, the faulting PC
+ */
+#define IMX_SIP_DEBUG_FAULT		0xC2000101
 
 #define IMX_SIP_CPUFREQ			0xC2000001
 #define IMX_SIP_SET_CPUFREQ		0x00

@@ -29,6 +29,10 @@
 #include <lib/mmio.h>
 #include <lib/xlat_tables/xlat_tables_v2.h>
 
+#include <context.h>
+#include <lib/el3_runtime/context_mgmt.h>
+#include <plat/common/platform.h>
+
 #include "imx95_dwc3.h"
 
 /* ------------------------------------------------------------------ bases */
@@ -151,6 +155,38 @@
  */
 #define VENDOR_REQ_MEM_READ	0x02
 #define VENDOR_REQ_MEM_WRITE	0x03
+/*
+ * Debug monitor.  The stub runs in EL3, so when it is entered the interrupted
+ * non-secure context is already saved -- the running PC and registers are
+ * reachable without any cooperation from osdyne.  "Stopping" is therefore just
+ * declining to return to it.  See docs/debug-api.md in the stm32mp2 bringup
+ * tree, which specifies this protocol; the two platforms speak the same wire.
+ */
+#define VENDOR_REQ_STOP		0x04
+#define VENDOR_REQ_RESUME	0x05
+#define VENDOR_REQ_STATUS	0x06
+#define VENDOR_REQ_REGS		0x07
+/*
+ * Self-hosted debug.  These are the operations memory cannot express: stepping
+ * needs MDSCR_EL1.SS and the step exception, and breakpoints and watchpoints
+ * live in system registers.  Addresses arrive in the OUT data stage because
+ * wValue/wIndex are already spent on the address in the peek/poke requests and
+ * a watchpoint needs a length and an access kind besides.
+ */
+#define VENDOR_REQ_STEP		0x08
+#define VENDOR_REQ_SET_BP	0x09
+#define VENDOR_REQ_CLEAR_BP	0x0a
+#define VENDOR_REQ_SET_WP	0x0b
+#define VENDOR_REQ_CLEAR_WP	0x0c
+#define VENDOR_REQ_DEBUG_CAPS	0x0d
+
+/*
+ * wValue on VENDOR_REQ_RESUME: 0 resumes where the debuggee stopped, 1 steps
+ * over the faulting instruction first.  A fault stop is otherwise a trap --
+ * returning to an instruction that aborted just aborts again -- so the skip is
+ * what makes "inspect a fault, then carry on" actually possible.
+ */
+#define RESUME_SKIP_FAULTING_INSN	1U
 
 #define EVENT_COUNT	64
 #define EVENT_BYTES	(EVENT_COUNT * 4)
@@ -564,6 +600,585 @@ static void gadget_start(void)
 	NOTICE("dwc3(el3): gadget up gsnpsid=0x%x\n", rd(GSNPSID));
 }
 
+/* ------------------------------------------------------- debug monitor */
+
+/*
+ * Set by the host via VENDOR_REQ_STOP.  The FIQ handler parks in EL3 while it
+ * is set, still draining the USB event ring, so the host can inspect and
+ * resume.  Volatile because it is written from the EP0 handler and read by the
+ * loop that the same handler runs inside.
+ */
+static volatile bool dbg_stop_requested;
+static volatile bool dbg_stopped;
+static volatile uint32_t dbg_stop_reason;
+
+/*
+ * Fault detail latched on entry to the monitor.  dbg_fault_pc is set only when
+ * the reported PC is not simply where EL3 will return (the payload-reported
+ * case), and cleared on resume so a later host stop does not inherit it.
+ */
+static volatile uint64_t dbg_fault_esr;
+static volatile uint64_t dbg_fault_far;
+static volatile uint64_t dbg_fault_pc;
+
+/* Set by VENDOR_REQ_RESUME with wValue == RESUME_SKIP_FAULTING_INSN. */
+static volatile bool dbg_resume_skip;
+
+/*
+ * True once the controller is up.  The fault paths run at times the console
+ * path never does -- an abort during early BL31 setup, say -- and parking to
+ * poll a controller that has no clocks would replace a diagnosable panic with
+ * a silent hang, so they check this first.
+ */
+static volatile bool dwc3_ready;
+
+/*
+ * The non-secure context TF-A saved when it took the interrupt that brought us
+ * into EL3.  This is what makes a stub debugger practical here: the registers
+ * of whatever was running are already spilled, so reporting them costs nothing.
+ */
+static void *dbg_ns_context;
+
+/* Layout of the VENDOR_REQ_STATUS reply.  Little-endian, packed. */
+struct dbg_status {
+	uint32_t stopped;
+	uint32_t reason;
+	uint64_t pc;    /* ELR_EL3: where the non-secure world will resume */
+	uint64_t spsr;  /* SPSR_EL3: its exception level and interrupt masks */
+	uint64_t sp;    /* the stack the debuggee is actually using */
+	uint64_t esr;   /* fault syndrome, 0 when the stop was not a fault */
+	uint64_t far;   /* faulting address, where the syndrome provides one */
+};
+
+static uint32_t dbg_fill_status(void *out)
+{
+	struct dbg_status st = {
+		.stopped = dbg_stopped ? 1U : 0U,
+		.reason = dbg_stop_reason,
+		.pc = 0U,
+		.spsr = 0U,
+		.sp = 0U,
+		.esr = dbg_fault_esr,
+		.far = dbg_fault_far,
+	};
+
+	if (dbg_ns_context != NULL) {
+		st.pc = read_ctx_reg(get_el3state_ctx(dbg_ns_context), CTX_ELR_EL3);
+		st.spsr = read_ctx_reg(get_el3state_ctx(dbg_ns_context), CTX_SPSR_EL3);
+
+		/*
+		 * Which stack pointer is live depends on SPSR.M: an EL1h
+		 * debuggee is using SP_EL1, and its SP_EL0 is meaningless.
+		 * SP_EL1 is not in the saved context -- TF-A only spills EL1
+		 * system registers on a world switch, and an interrupt that
+		 * returns to the same world is not one -- but it is still the
+		 * debuggee's, so read it live.
+		 */
+		if ((st.spsr & 0xfU) == 0x5U) {
+			st.sp = read_sp_el1();
+		} else {
+			st.sp = read_ctx_reg(get_gpregs_ctx(dbg_ns_context),
+					     CTX_GPREG_SP_EL0);
+		}
+	}
+
+	/*
+	 * When the payload reported the fault itself, ELR_EL3 points into its
+	 * exception handler -- the address worth showing is the one it told us
+	 * it faulted at.
+	 */
+	if (dbg_fault_pc != 0U) {
+		st.pc = dbg_fault_pc;
+	}
+
+	memcpy(out, &st, sizeof(st));
+	return (uint32_t)sizeof(st);
+}
+
+/* x0..x30 of the interrupted non-secure context, in order. */
+static uint32_t dbg_fill_regs(void *out)
+{
+	uint64_t *dst = (uint64_t *)out;
+	unsigned int i;
+
+	if (dbg_ns_context == NULL) {
+		memset(out, 0, 31U * sizeof(uint64_t));
+		return 31U * (uint32_t)sizeof(uint64_t);
+	}
+
+	for (i = 0U; i < 31U; i++) {
+		dst[i] = read_ctx_reg(get_gpregs_ctx(dbg_ns_context),
+				      CTX_GPREG_X0 + (i * 8U));
+	}
+
+	return 31U * (uint32_t)sizeof(uint64_t);
+}
+
+/* ------------------------------------------------- self-hosted debug */
+
+/*
+ * Self-hosted debug exceptions cannot be taken to EL3.  The architecture sends
+ * them to EL1, or to EL2 when a hypervisor sets MDCR_EL2.TDE -- there is no
+ * equivalent bit in MDCR_EL3, which governs only external debug and secure
+ * debug.  So unlike stopping and unlike external aborts, breakpoints do need
+ * the payload's cooperation: EL3 owns the debug registers (they are EL1
+ * system registers, writable from EL3) and the payload routes the exception
+ * back through STM32_SIP_SMC_DEBUG_FAULT.
+ *
+ * KDE is what enables debug exceptions taken to the EL being debugged, which
+ * is what "EL1 debugging itself" means here.  MDE enables breakpoint and
+ * watchpoint events at all.
+ */
+/* SPSR DAIF is bits [9:6]; D (debug exception mask) is the top one. */
+#define SPSR_D_BIT		(ULL(1) << 9)
+
+#define MDSCR_SS_BIT		(U(1) << 0)
+#define MDSCR_KDE_BIT		(U(1) << 13)
+#define MDSCR_MDE_BIT		(U(1) << 15)
+
+/* PSTATE.SS in SPSR (arch.h) is the other half of the step state machine. */
+
+/*
+ * DBGBCR<n>_EL1 / DBGWCR<n>_EL1: enable, byte-select, and the {HMC, SSC, PMC}
+ * triple that says which exception levels the match applies to.  Which triple
+ * is right depends on where the debuggee runs -- osdyne is at EL2 on this
+ * platform and at EL1 on others -- so it is derived from the debuggee's own
+ * SPSR rather than fixed.  Getting it wrong fails silently: the breakpoint is
+ * programmed, enabled, and simply never matches.
+ *
+ * SSC = 0b00 with these leaves the match applying in both security states,
+ * which is harmless because there is no secure payload to break into.
+ */
+#define DBGBCR_E		(U(1) << 0)
+#define DBGBCR_BAS_ALL		(U(0xf) << 5)
+#define DBGBCR_HMC		(U(1) << 13)
+
+#define DBGWCR_E		(U(1) << 0)
+#define DBGWCR_LSC_SHIFT	3
+#define DBGWCR_BAS_SHIFT	5
+#define DBGWCR_HMC		(U(1) << 13)
+
+/* PMC for breakpoints, PAC for watchpoints; same field position and meaning. */
+#define DBG_PMC_SHIFT		1
+
+/*
+ * The {HMC, PMC} pair for the exception level the debuggee is running at.
+ * EL1: HMC=0, PMC=0b11 matches EL1 and EL0 -- the combination verified on the
+ * stm32mp2 monitor.  EL2: HMC=1, PMC=0b00.
+ */
+static uint64_t dbg_el_control(void)
+{
+	uint64_t spsr = 0U;
+	unsigned int el;
+
+	if (dbg_ns_context != NULL) {
+		spsr = read_ctx_reg(get_el3state_ctx(dbg_ns_context),
+				    CTX_SPSR_EL3);
+	}
+
+	/* SPSR.M[3:2] is the exception level the debuggee will return to. */
+	el = (unsigned int)((spsr >> 2) & 0x3U);
+
+	if (el >= 2U) {
+		return DBGBCR_HMC | (U(0) << DBG_PMC_SHIFT);
+	}
+
+	return U(3) << DBG_PMC_SHIFT;
+}
+
+#define DBG_MAX_SLOTS		16U
+
+static unsigned int dbg_nr_bp;
+static unsigned int dbg_nr_wp;
+static uint64_t dbg_bp_addr[DBG_MAX_SLOTS];
+static uint64_t dbg_wp_addr[DBG_MAX_SLOTS];
+static uint32_t dbg_bp_used;
+static uint32_t dbg_wp_used;
+
+/* Set while a single step is armed, so the step exception knows it is ours. */
+static volatile bool dbg_step_pending;
+
+/*
+ * The vendor request whose 8-byte address argument is still in flight on EP0,
+ * applied when the OUT data stage completes.
+ */
+static uint8_t dbg_arg_pending;
+static uint8_t dbg_wp_len;
+static uint8_t dbg_wp_access;
+
+/*
+ * The register number is part of the instruction encoding, so there is no way
+ * to index these other than by unrolling.  Six breakpoints and four
+ * watchpoints is what this core has; the tables are sized for the
+ * architectural maximum and bounded by what ID_AA64DFR0_EL1 reports.
+ */
+#define DBG_WRITE_CASE(reg, n, v)					\
+	case n:								\
+		__asm__ volatile("msr " #reg #n "_el1, %0" : : "r" (v));\
+		break
+
+static void dbg_write_bvr(unsigned int n, uint64_t v)
+{
+	switch (n) {
+	DBG_WRITE_CASE(dbgbvr, 0, v); DBG_WRITE_CASE(dbgbvr, 1, v);
+	DBG_WRITE_CASE(dbgbvr, 2, v); DBG_WRITE_CASE(dbgbvr, 3, v);
+	DBG_WRITE_CASE(dbgbvr, 4, v); DBG_WRITE_CASE(dbgbvr, 5, v);
+	DBG_WRITE_CASE(dbgbvr, 6, v); DBG_WRITE_CASE(dbgbvr, 7, v);
+	DBG_WRITE_CASE(dbgbvr, 8, v); DBG_WRITE_CASE(dbgbvr, 9, v);
+	DBG_WRITE_CASE(dbgbvr, 10, v); DBG_WRITE_CASE(dbgbvr, 11, v);
+	DBG_WRITE_CASE(dbgbvr, 12, v); DBG_WRITE_CASE(dbgbvr, 13, v);
+	DBG_WRITE_CASE(dbgbvr, 14, v); DBG_WRITE_CASE(dbgbvr, 15, v);
+	default: break;
+	}
+}
+
+static void dbg_write_bcr(unsigned int n, uint64_t v)
+{
+	switch (n) {
+	DBG_WRITE_CASE(dbgbcr, 0, v); DBG_WRITE_CASE(dbgbcr, 1, v);
+	DBG_WRITE_CASE(dbgbcr, 2, v); DBG_WRITE_CASE(dbgbcr, 3, v);
+	DBG_WRITE_CASE(dbgbcr, 4, v); DBG_WRITE_CASE(dbgbcr, 5, v);
+	DBG_WRITE_CASE(dbgbcr, 6, v); DBG_WRITE_CASE(dbgbcr, 7, v);
+	DBG_WRITE_CASE(dbgbcr, 8, v); DBG_WRITE_CASE(dbgbcr, 9, v);
+	DBG_WRITE_CASE(dbgbcr, 10, v); DBG_WRITE_CASE(dbgbcr, 11, v);
+	DBG_WRITE_CASE(dbgbcr, 12, v); DBG_WRITE_CASE(dbgbcr, 13, v);
+	DBG_WRITE_CASE(dbgbcr, 14, v); DBG_WRITE_CASE(dbgbcr, 15, v);
+	default: break;
+	}
+}
+
+static void dbg_write_wvr(unsigned int n, uint64_t v)
+{
+	switch (n) {
+	DBG_WRITE_CASE(dbgwvr, 0, v); DBG_WRITE_CASE(dbgwvr, 1, v);
+	DBG_WRITE_CASE(dbgwvr, 2, v); DBG_WRITE_CASE(dbgwvr, 3, v);
+	DBG_WRITE_CASE(dbgwvr, 4, v); DBG_WRITE_CASE(dbgwvr, 5, v);
+	DBG_WRITE_CASE(dbgwvr, 6, v); DBG_WRITE_CASE(dbgwvr, 7, v);
+	DBG_WRITE_CASE(dbgwvr, 8, v); DBG_WRITE_CASE(dbgwvr, 9, v);
+	DBG_WRITE_CASE(dbgwvr, 10, v); DBG_WRITE_CASE(dbgwvr, 11, v);
+	DBG_WRITE_CASE(dbgwvr, 12, v); DBG_WRITE_CASE(dbgwvr, 13, v);
+	DBG_WRITE_CASE(dbgwvr, 14, v); DBG_WRITE_CASE(dbgwvr, 15, v);
+	default: break;
+	}
+}
+
+static void dbg_write_wcr(unsigned int n, uint64_t v)
+{
+	switch (n) {
+	DBG_WRITE_CASE(dbgwcr, 0, v); DBG_WRITE_CASE(dbgwcr, 1, v);
+	DBG_WRITE_CASE(dbgwcr, 2, v); DBG_WRITE_CASE(dbgwcr, 3, v);
+	DBG_WRITE_CASE(dbgwcr, 4, v); DBG_WRITE_CASE(dbgwcr, 5, v);
+	DBG_WRITE_CASE(dbgwcr, 6, v); DBG_WRITE_CASE(dbgwcr, 7, v);
+	DBG_WRITE_CASE(dbgwcr, 8, v); DBG_WRITE_CASE(dbgwcr, 9, v);
+	DBG_WRITE_CASE(dbgwcr, 10, v); DBG_WRITE_CASE(dbgwcr, 11, v);
+	DBG_WRITE_CASE(dbgwcr, 12, v); DBG_WRITE_CASE(dbgwcr, 13, v);
+	DBG_WRITE_CASE(dbgwcr, 14, v); DBG_WRITE_CASE(dbgwcr, 15, v);
+	default: break;
+	}
+}
+
+/*
+ * Arm the debug plumbing the first time anything is set.  Deferred rather than
+ * done at init so a board that never attaches a debugger runs with debug
+ * exceptions routed where the architecture would put them anyway.
+ */
+static void dbg_enable_traps(void)
+{
+	static bool done;
+	void *ctx;
+	uint64_t dfr0;
+
+	if (done) {
+		return;
+	}
+
+	ctx = cm_get_context(NON_SECURE);
+	if (ctx == NULL) {
+		return;
+	}
+
+	dfr0 = read_id_aa64dfr0_el1();
+	dbg_nr_bp = (unsigned int)(((dfr0 >> 12) & 0xfU) + 1U);
+	dbg_nr_wp = (unsigned int)(((dfr0 >> 20) & 0xfU) + 1U);
+	if (dbg_nr_bp > DBG_MAX_SLOTS) {
+		dbg_nr_bp = DBG_MAX_SLOTS;
+	}
+	if (dbg_nr_wp > DBG_MAX_SLOTS) {
+		dbg_nr_wp = DBG_MAX_SLOTS;
+	}
+
+	/*
+	 * Both locks gate debug exceptions entirely and at least one of them is
+	 * set out of reset, so nothing below matters until they are cleared.
+	 * OS lock: OSLAR_EL1 = 0.  Double lock: OSDLR_EL1.DLK = 0.
+	 */
+	__asm__ volatile("msr oslar_el1, %0" : : "r" (ULL(0)));
+	__asm__ volatile("msr osdlr_el1, %0" : : "r" (ULL(0)));
+	isb();
+
+	write_mdscr_el1(read_mdscr_el1() | MDSCR_MDE_BIT | MDSCR_KDE_BIT);
+	isb();
+
+	NOTICE("dwc3(el3): self-hosted debug armed (%u breakpoints, %u watchpoints)\n",
+	       dbg_nr_bp, dbg_nr_wp);
+
+	done = true;
+}
+
+static bool dbg_set_bp(uint64_t addr)
+{
+	unsigned int n;
+
+	dbg_enable_traps();
+
+	for (n = 0U; n < dbg_nr_bp; n++) {
+		if ((dbg_bp_used & BIT_32(n)) == 0U) {
+			dbg_bp_used |= BIT_32(n);
+			dbg_bp_addr[n] = addr;
+			dbg_write_bvr(n, addr & ~ULL(3));
+			dbg_write_bcr(n, DBGBCR_E | DBGBCR_BAS_ALL |
+					 dbg_el_control());
+			isb();
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool dbg_clear_bp(uint64_t addr, bool all)
+{
+	unsigned int n;
+	bool hit = false;
+
+	for (n = 0U; n < dbg_nr_bp; n++) {
+		if ((dbg_bp_used & BIT_32(n)) == 0U) {
+			continue;
+		}
+		if (!all && (dbg_bp_addr[n] != addr)) {
+			continue;
+		}
+		dbg_write_bcr(n, 0U);
+		dbg_bp_used &= ~BIT_32(n);
+		hit = true;
+	}
+	isb();
+
+	return hit;
+}
+
+/*
+ * @len is the watched length in bytes and @access is 1 for loads, 2 for stores
+ * and 3 for both, matching DBGWCR.LSC.  BAS selects which bytes of the
+ * doubleword the address sits in are watched.
+ */
+static bool dbg_set_wp(uint64_t addr, unsigned int len, unsigned int access)
+{
+	unsigned int n;
+	uint64_t bas;
+
+	dbg_enable_traps();
+
+	if ((len == 0U) || (len > 8U)) {
+		return false;
+	}
+	if ((access == 0U) || (access > 3U)) {
+		return false;
+	}
+
+	/* BAS is relative to the doubleword-aligned address in DBGWVR. */
+	bas = ((ULL(1) << len) - 1U) << (addr & ULL(7));
+
+	for (n = 0U; n < dbg_nr_wp; n++) {
+		if ((dbg_wp_used & BIT_32(n)) == 0U) {
+			dbg_wp_used |= BIT_32(n);
+			dbg_wp_addr[n] = addr;
+			dbg_write_wvr(n, addr & ~ULL(7));
+			dbg_write_wcr(n, DBGWCR_E | dbg_el_control() |
+					 ((uint64_t)access << DBGWCR_LSC_SHIFT) |
+					 (bas << DBGWCR_BAS_SHIFT));
+			isb();
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool dbg_clear_wp(uint64_t addr, bool all)
+{
+	unsigned int n;
+	bool hit = false;
+
+	for (n = 0U; n < dbg_nr_wp; n++) {
+		if ((dbg_wp_used & BIT_32(n)) == 0U) {
+			continue;
+		}
+		if (!all && (dbg_wp_addr[n] != addr)) {
+			continue;
+		}
+		dbg_write_wcr(n, 0U);
+		dbg_wp_used &= ~BIT_32(n);
+		hit = true;
+	}
+	isb();
+
+	return hit;
+}
+
+/* Reply to VENDOR_REQ_DEBUG_CAPS. */
+struct dbg_caps {
+	uint32_t nr_bp;
+	uint32_t nr_wp;
+	uint32_t bp_used;
+	uint32_t wp_used;
+	/* Readbacks, so a step that silently does nothing can be diagnosed. */
+	uint64_t mdscr;
+	uint64_t oslsr;
+	uint64_t bvr0;
+	uint64_t bcr0;
+};
+
+static uint32_t dbg_fill_caps(void *out)
+{
+	struct dbg_caps c;
+
+	dbg_enable_traps();
+
+	c.nr_bp = dbg_nr_bp;
+	c.nr_wp = dbg_nr_wp;
+	c.bp_used = dbg_bp_used;
+	c.wp_used = dbg_wp_used;
+	c.mdscr = read_mdscr_el1();
+	__asm__ volatile("mrs %0, oslsr_el1" : "=r" (c.oslsr));
+	__asm__ volatile("mrs %0, dbgbvr0_el1" : "=r" (c.bvr0));
+	__asm__ volatile("mrs %0, dbgbcr0_el1" : "=r" (c.bcr0));
+
+	memcpy(out, &c, sizeof(c));
+	return (uint32_t)sizeof(c);
+}
+
+/*
+ * Monitor-mode park.  Staying here is what "stopped" means: the non-secure
+ * world does not run again until the host resumes it.  The USB event ring is
+ * drained by polling, which is what keeps the console and every other vendor
+ * request alive while the target is stopped -- including, crucially, when we
+ * were entered from a fault rather than from an interrupt.
+ *
+ * Returns true when the host asked to step over the faulting instruction.
+ */
+static bool dbg_park(void)
+{
+	bool skip;
+
+	while (dbg_stop_requested) {
+		dbg_stopped = true;
+		imx95_dwc3_service();
+	}
+
+	skip = dbg_resume_skip;
+
+	if (dbg_ns_context != NULL) {
+		el3_state_t *st = get_el3state_ctx(dbg_ns_context);
+		uint64_t spsr = read_ctx_reg(st, CTX_SPSR_EL3);
+
+		/*
+		 * BL31 hands the payload PSTATE.D set, which masks debug
+		 * exceptions entirely -- a breakpoint programmed into the
+		 * registers simply never fires.  Unmask on the way out
+		 * whenever something is armed; leave it alone otherwise, so a
+		 * payload that is not being debugged runs as it always did.
+		 */
+		if ((dbg_bp_used != 0U) || (dbg_wp_used != 0U) ||
+		    dbg_step_pending) {
+			spsr &= ~SPSR_D_BIT;
+		}
+
+		/*
+		 * Arm a single step.  Both halves are needed: MDSCR_EL1
+		 * enables stepping, and PSTATE.SS in the restored SPSR is what
+		 * makes the exception fire after exactly one instruction.
+		 */
+		if (dbg_step_pending) {
+			write_mdscr_el1(read_mdscr_el1() | MDSCR_SS_BIT);
+			isb();
+			spsr |= SPSR_SS_BIT;
+		}
+
+		write_ctx_reg(st, CTX_SPSR_EL3, spsr);
+	}
+
+	dbg_resume_skip = false;
+	dbg_stopped = false;
+	dbg_stop_reason = DBG_REASON_RUNNING;
+	dbg_fault_esr = 0U;
+	dbg_fault_far = 0U;
+	dbg_fault_pc = 0U;
+
+	return skip;
+}
+
+bool imx95_dwc3_debug_fault(unsigned int reason, void *handle,
+				 uint64_t esr, uint64_t far, uint64_t pc)
+{
+	/*
+	 * An SMC handler is not given the interrupted context, but TF-A has
+	 * saved it by the time we run, so ask for it rather than reporting a
+	 * stale one left over from the last interrupt.
+	 */
+	if (!dwc3_ready) {
+		return false;
+	}
+
+	if (handle != NULL) {
+		dbg_ns_context = handle;
+	} else {
+		dbg_ns_context = cm_get_context(NON_SECURE);
+	}
+
+	dbg_fault_esr = esr;
+	dbg_fault_far = far;
+	dbg_fault_pc = pc;
+	dbg_stop_reason = reason;
+
+	/*
+	 * A step has happened, so disarm before parking.  Leaving it armed
+	 * would make the next resume step again -- and step the payload's own
+	 * exception handler, which is not what anyone asked for.
+	 */
+	if (reason == DBG_REASON_STEP) {
+		write_mdscr_el1(read_mdscr_el1() & ~MDSCR_SS_BIT);
+		isb();
+		dbg_step_pending = false;
+	}
+
+	/*
+	 * A fault stops the target whether or not a host is watching: that is
+	 * the whole point.  If nobody ever attaches, this is a hang -- but it
+	 * is a hang the host can still connect to and inspect, which is what
+	 * the alternative (panic, or a payload spinning in its own handler
+	 * with USB dead) does not offer.
+	 */
+	dbg_stop_requested = true;
+
+	return dbg_park();
+}
+
+bool imx95_dwc3_debug_ready(void)
+{
+	return dwc3_ready;
+}
+
+void imx95_dwc3_debug_park(void)
+{
+	(void)dbg_park();
+}
+
+void imx95_dwc3_debug_context(void *handle)
+{
+	dbg_ns_context = handle;
+}
+
 /* --------------------------------------------------------------- handle_setup */
 
 /* Stage a device->host reply into ep0_data; return bytes to send. */
@@ -721,6 +1336,58 @@ static int handle_setup(uint8_t bmreq, uint8_t brequest, uint16_t wvalue,
 			return stage_reply(MS_COMPAT_ID, sizeof(MS_COMPAT_ID), wlen);
 		if (brequest == VENDOR_REQ_REBOOT && wvalue == REBOOT_MAGIC)
 			return 0;
+		/*
+		 * Accept these here so the control transfer is not stalled; the
+		 * flags themselves are set in the status stage, alongside the
+		 * reboot request, so the device has already acknowledged the
+		 * request by the time it acts on it.
+		 */
+		if (brequest == VENDOR_REQ_STOP || brequest == VENDOR_REQ_RESUME ||
+		    brequest == VENDOR_REQ_STEP)
+			return 0;
+		if ((brequest == VENDOR_REQ_CLEAR_BP ||
+		     brequest == VENDOR_REQ_CLEAR_WP) && (bmreq & 0x80U) == 0U) {
+			/* wValue != 0 means "all"; otherwise the address follows. */
+			if (wvalue != 0U)
+				return 0;
+			if (wlen != sizeof(uint64_t))
+				return -1;
+			dbg_arg_pending = brequest;
+			return (int)wlen;
+		}
+		if (brequest == VENDOR_REQ_SET_BP && (bmreq & 0x80U) == 0U) {
+			if (wlen != sizeof(uint64_t))
+				return -1;
+			dbg_arg_pending = brequest;
+			return (int)wlen;
+		}
+		if (brequest == VENDOR_REQ_SET_WP && (bmreq & 0x80U) == 0U) {
+			/* wIndex carries the length (high) and access kind (low). */
+			if (wlen != sizeof(uint64_t))
+				return -1;
+			dbg_wp_len = (windex >> 8) & 0xffU;
+			dbg_wp_access = windex & 0xffU;
+			dbg_arg_pending = brequest;
+			return (int)wlen;
+		}
+		if (brequest == VENDOR_REQ_STATUS && (bmreq & 0x80U) != 0U) {
+			uint32_t n = dbg_fill_status((void *)MEM->ep0_data);
+
+			dcache_flush((uintptr_t)MEM->ep0_data, n);
+			return wlen < n ? wlen : n;
+		}
+		if (brequest == VENDOR_REQ_REGS && (bmreq & 0x80U) != 0U) {
+			uint32_t n = dbg_fill_regs((void *)MEM->ep0_data);
+
+			dcache_flush((uintptr_t)MEM->ep0_data, n);
+			return wlen < n ? wlen : n;
+		}
+		if (brequest == VENDOR_REQ_DEBUG_CAPS && (bmreq & 0x80U) != 0U) {
+			uint32_t n = dbg_fill_caps((void *)MEM->ep0_data);
+
+			dcache_flush((uintptr_t)MEM->ep0_data, n);
+			return wlen < n ? wlen : n;
+		}
 		if (brequest == VENDOR_REQ_MEM_READ && (bmreq & 0x80U) != 0U) {
 			/* device->host: read [addr, addr+wlen) into ep0_data. */
 			uintptr_t addr = ((uintptr_t)wvalue << 16) | windex;
@@ -812,6 +1479,32 @@ static void handle_ep0_xfercomplete(unsigned int ep)
 			if (bmreq == 0x40 && brequest == VENDOR_REQ_REBOOT &&
 			    wvalue == REBOOT_MAGIC)
 				reboot_pending = true;
+			if (bmreq == 0x40 && brequest == VENDOR_REQ_STOP) {
+				dbg_stop_reason = DBG_REASON_HOST;
+				dbg_stop_requested = true;
+			}
+			if (bmreq == 0x40 && brequest == VENDOR_REQ_RESUME) {
+				dbg_resume_skip =
+					(wvalue == RESUME_SKIP_FAULTING_INSN);
+				dbg_stop_requested = false;
+			}
+			if (bmreq == 0x40 && brequest == VENDOR_REQ_STEP) {
+				/*
+				 * Stepping needs the same enables a breakpoint
+				 * does -- KDE above all, without which a
+				 * same-EL debug exception is simply not taken.
+				 */
+				dbg_enable_traps();
+				/* Leaving the park arms the step; see dbg_park. */
+				dbg_step_pending = true;
+				dbg_stop_requested = false;
+			}
+			if (bmreq == 0x40 && brequest == VENDOR_REQ_CLEAR_BP &&
+			    wvalue != 0U)
+				(void)dbg_clear_bp(0U, true);
+			if (bmreq == 0x40 && brequest == VENDOR_REQ_CLEAR_WP &&
+			    wvalue != 0U)
+				(void)dbg_clear_wp(0U, true);
 			ep0_state = EP0_STATE_STATUS_PENDING;
 		}
 	} else if (ep0_state == EP0_STATE_DATA) {
@@ -821,6 +1514,30 @@ static void handle_ep0_xfercomplete(unsigned int ep)
 			mem_write_range(mem_write_addr,
 					(const uint8_t *)MEM->ep0_data, mem_write_len);
 			mem_write_pending = false;
+		}
+		if (dbg_arg_pending != 0U && ep == EP0_OUT) {
+			uint64_t addr;
+
+			dcache_flush((uintptr_t)MEM->ep0_data, sizeof(addr));
+			memcpy(&addr, (const void *)MEM->ep0_data, sizeof(addr));
+
+			switch (dbg_arg_pending) {
+			case VENDOR_REQ_SET_BP:
+				(void)dbg_set_bp(addr);
+				break;
+			case VENDOR_REQ_CLEAR_BP:
+				(void)dbg_clear_bp(addr, false);
+				break;
+			case VENDOR_REQ_SET_WP:
+				(void)dbg_set_wp(addr, dbg_wp_len, dbg_wp_access);
+				break;
+			case VENDOR_REQ_CLEAR_WP:
+				(void)dbg_clear_wp(addr, false);
+				break;
+			default:
+				break;
+			}
+			dbg_arg_pending = 0U;
 		}
 		ep0_state = EP0_STATE_STATUS_PENDING;
 	} else if (ep0_state == EP0_STATE_STATUS) {
@@ -1058,4 +1775,6 @@ void imx95_dwc3_gadget_init(void)
 	CHAN->magic = CONSOLE_CHAN_MAGIC;
 
 	gadget_start();
+
+	dwc3_ready = true;
 }

@@ -27,6 +27,7 @@
 #include <drivers/arm/gicv3.h>
 #include "../drivers/arm/gic/v3/gicv3_private.h"
 
+#include <bl31/ea_handle.h>
 #include <bl31/interrupt_mgmt.h>
 #include "imx95_dwc3.h"
 
@@ -177,13 +178,96 @@ static uint64_t imx95_dwc3_fiq_handler(uint32_t id, uint32_t flags,
 {
 	uint32_t irq = plat_ic_acknowledge_interrupt();
 
-	if (irq == IMX95_DWC3_INTID)
+	if (irq == IMX95_DWC3_INTID) {
+		/*
+		 * TF-A hands us the context of whatever it interrupted, which
+		 * for our purposes is the debuggee.  Remember it so the host
+		 * can read its PC and registers.
+		 */
+		imx95_dwc3_debug_context(handle);
+
 		imx95_dwc3_service();
+
+		/*
+		 * Park if the host has asked us to stop.  End-of-interrupt is
+		 * deliberately still outstanding, which keeps the GIC priority
+		 * masked so no nested FIQ re-enters the monitor.
+		 */
+		imx95_dwc3_debug_park();
+	}
 
 	if (irq < 1022U)
 		plat_ic_end_of_interrupt(irq);
 
 	return 0;
+}
+
+/*
+ * With HANDLE_EA_EL3_FIRST_NS, SCR_EL3.EA routes external aborts and SErrors
+ * from the non-secure world to EL3 instead of to osdyne.  TF-A's default
+ * handler prints and panics, which leaves a dead board.  Park in the USB
+ * monitor instead, so the crash can be inspected over the same pipe that
+ * carries the console.
+ */
+void plat_ea_handler(unsigned int ea_reason, uint64_t syndrome, void *cookie,
+		     void *handle, uint64_t flags)
+{
+	unsigned int reason;
+	uint64_t far = 0U;
+
+	(void)cookie;
+	(void)flags;
+
+	if (!imx95_dwc3_debug_ready()) {
+		/* No monitor to park in yet: die the way TF-A would have. */
+		plat_default_ea_handler(ea_reason, syndrome, cookie, handle,
+					flags);
+		return;
+	}
+
+	if (ea_reason == ERROR_EA_ASYNC) {
+		/* SError: asynchronous, so FAR_EL3 means nothing. */
+		reason = DBG_REASON_EA_ASYNC;
+	} else {
+		reason = DBG_REASON_EA_SYNC;
+		far = read_far_el3();
+	}
+
+	ERROR("dwc3(el3): external abort (reason %u, esr 0x%llx) -- parking in the debug monitor\n",
+	      ea_reason, (unsigned long long)syndrome);
+
+	/*
+	 * Returning resumes the faulting instruction, which will simply abort
+	 * again -- so honour a host "resume --skip" by stepping over it.  The
+	 * abort was synchronous and precise, so ELR_EL3 is the aborting
+	 * instruction and A64 instructions are all four bytes.
+	 */
+	if (imx95_dwc3_debug_fault(reason, handle, syndrome, far, 0U) &&
+	    (reason == DBG_REASON_EA_SYNC)) {
+		el3_state_t *st = get_el3state_ctx(handle);
+
+		write_ctx_reg(st, CTX_ELR_EL3,
+			      read_ctx_reg(st, CTX_ELR_EL3) + 4U);
+	}
+}
+
+/*
+ * A BL31 panic is normally a silently dead board: no console, no reset, and
+ * nothing left to ask.  The gadget is serviced by polling, so it can still run
+ * here; park and let the host look at whatever osdyne was doing.
+ */
+void __dead2 plat_panic_handler(void)
+{
+	while (imx95_dwc3_debug_ready()) {
+		(void)imx95_dwc3_debug_fault(DBG_REASON_EL3_PANIC, NULL,
+					     0U, 0U, 0U);
+	}
+
+	/* Panicked before the gadget came up; nothing can be inspected. */
+	imx_system_reset();
+
+	while (true) {
+	}
 }
 
 void bl31_platform_setup(void)

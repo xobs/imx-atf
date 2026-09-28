@@ -13,6 +13,9 @@
 #include <tools_share/uuid.h>
 
 #include <imx_sip_svc.h>
+#if defined(PLAT_imx95)
+#include "../imx9/imx95/imx95_dwc3.h"
+#endif
 
 #include <ele_api.h>
 
@@ -36,9 +39,49 @@ static uintptr_t imx_sip_handler(unsigned int smc_fid,
 		break;
 #if defined(PLAT_imx95)
 	case IMX_SIP_USB_CONSOLE: {
-		extern void imx95_dwc3_console_kick(void);
 		imx95_dwc3_console_kick();
 		SMC_RET1(handle, 0);
+		break;
+	}
+	case IMX_SIP_DEBUG_FAULT: {
+		/*
+		 * Faults the architecture delivers to EL1 never reach EL3 on
+		 * their own, so this is osdyne's way into the same monitor that
+		 * external aborts reach by themselves.  It blocks until the
+		 * host resumes.
+		 *
+		 * Each debug class has a lower-EL and a same-EL encoding.
+		 * osdyne debugs itself, so in practice these arrive as the
+		 * same-EL form (0x31/0x33/0x35); the lower-EL ones are accepted
+		 * for a kernel that one day runs something beneath it.
+		 */
+		unsigned int reason;
+		bool skip;
+
+		switch ((unsigned int)((x1 >> 26) & 0x3fU)) {
+		case 0x30U:
+		case 0x31U:
+			reason = DBG_REASON_BREAKPOINT;
+			break;
+		case 0x32U:
+		case 0x33U:
+			reason = DBG_REASON_STEP;
+			break;
+		case 0x34U:
+		case 0x35U:
+			reason = DBG_REASON_WATCHPOINT;
+			break;
+		case 0x3cU:
+			reason = DBG_REASON_BRK;
+			break;
+		default:
+			reason = DBG_REASON_PAYLOAD;
+			break;
+		}
+
+		skip = imx95_dwc3_debug_fault(reason, NULL, (uint64_t)x1,
+					      (uint64_t)x2, (uint64_t)x3);
+		SMC_RET2(handle, 0, skip ? 1UL : 0UL);
 		break;
 	}
 #endif
