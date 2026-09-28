@@ -179,6 +179,16 @@
 #define VENDOR_REQ_SET_WP	0x0b
 #define VENDOR_REQ_CLEAR_WP	0x0c
 #define VENDOR_REQ_DEBUG_CAPS	0x0d
+/*
+ * Whether a host is reading the console: wValue 1 when it opens the console
+ * endpoint, 0 when it closes it. It sets CHAN_HOST_READING, which is what
+ * tells osdyne to wait for room in a full TX ring rather than drop output --
+ * the convention RTT uses, where the host sets a channel's blocking mode when
+ * it connects and clears it when it goes. BL31 clears it too on a bus reset,
+ * a disconnect or a deconfiguration, so a host that vanishes without saying
+ * so cannot leave osdyne waiting on a ring nobody will drain.
+ */
+#define VENDOR_REQ_CONSOLE_READING	0x0e
 
 /*
  * wValue on VENDOR_REQ_RESUME: 0 resumes where the debuggee stopped, 1 steps
@@ -269,7 +279,7 @@ struct dwc3_mem {
 
 struct console_chan {
 	volatile uint32_t magic;
-	volatile uint32_t configured;
+	volatile uint32_t flags;	/* CHAN_*; written by EL3 only */
 	volatile uint32_t tx_head;	/* producer: EL1 */
 	volatile uint32_t tx_tail;	/* consumer: EL3 */
 	volatile uint32_t rx_head;	/* producer: EL3 */
@@ -277,6 +287,14 @@ struct console_chan {
 	volatile uint8_t tx_buf[TX_RING_SZ];
 	volatile uint8_t rx_buf[RX_RING_SZ];
 };
+
+/* The host has configured the device; BL31 drains the TX ring. */
+#define CHAN_CONFIGURED		(1U << 0)
+/*
+ * A host is reading the console (VENDOR_REQ_CONSOLE_READING), so osdyne waits
+ * for room in a full TX ring instead of dropping what it was writing.
+ */
+#define CHAN_HOST_READING	(1U << 1)
 
 #define CHAN ((volatile struct console_chan *)CONSOLE_CHAN_BASE)
 
@@ -437,7 +455,7 @@ static void dwc3_tx_pump(void)
 {
 	uint32_t n = 0;
 
-	if (!CHAN->configured || ep1_in_busy)
+	if ((CHAN->flags & CHAN_CONFIGURED) == 0U || ep1_in_busy)
 		return;
 	while (n < sizeof(MEM->tx_buf) && CHAN->tx_tail != CHAN->tx_head) {
 		MEM->tx_buf[n++] = CHAN->tx_buf[CHAN->tx_tail & (TX_RING_SZ - 1)];
@@ -535,7 +553,7 @@ static void set_configuration(void)
 	post_ep1_out();
 	configured = true;
 	ep1_in_busy = false;
-	CHAN->configured = 1;
+	CHAN->flags = CHAN_CONFIGURED;
 }
 
 static void gadget_start(void)
@@ -1313,8 +1331,10 @@ static int handle_setup(uint8_t bmreq, uint8_t brequest, uint16_t wvalue,
 			set_address(wvalue);
 			return 0;
 		case REQ_SET_CONFIGURATION:
-			if (wvalue == 0)
+			if (wvalue == 0) {
 				configured = false;
+				CHAN->flags = 0U;
+			}
 			return 0;
 		case REQ_GET_CONFIGURATION:
 			MEM->ep0_data[0] = configured ? 1 : 0;
@@ -1335,6 +1355,9 @@ static int handle_setup(uint8_t bmreq, uint8_t brequest, uint16_t wvalue,
 		if (brequest == MS_VENDOR_CODE && windex == 0x0004)
 			return stage_reply(MS_COMPAT_ID, sizeof(MS_COMPAT_ID), wlen);
 		if (brequest == VENDOR_REQ_REBOOT && wvalue == REBOOT_MAGIC)
+			return 0;
+		if (brequest == VENDOR_REQ_CONSOLE_READING && (bmreq & 0x80U) == 0U &&
+		    wvalue <= 1U && wlen == 0U)
 			return 0;
 		/*
 		 * Accept these here so the control transfer is not stalled; the
@@ -1476,6 +1499,12 @@ static void handle_ep0_xfercomplete(unsigned int ep)
 		} else {
 			if (brequest == REQ_SET_CONFIGURATION && wvalue != 0)
 				config_pending = true;
+			if (bmreq == 0x40 && brequest == VENDOR_REQ_CONSOLE_READING) {
+				if (wvalue != 0U)
+					CHAN->flags |= CHAN_HOST_READING;
+				else
+					CHAN->flags &= ~CHAN_HOST_READING;
+			}
 			if (bmreq == 0x40 && brequest == VENDOR_REQ_REBOOT &&
 			    wvalue == REBOOT_MAGIC)
 				reboot_pending = true;
@@ -1584,6 +1613,7 @@ static void process_event(uint32_t e)
 		/* Device event. */
 		switch ((e >> 8) & 0xf) {
 		case DEVT_DISCONNECT:
+			CHAN->flags &= ~CHAN_HOST_READING;
 			break;
 		case DEVT_USBRST:
 			set_address(0);
@@ -1591,7 +1621,7 @@ static void process_event(uint32_t e)
 			configured = false;
 			ep1_in_busy = false;
 			mem_write_pending = false;
-			CHAN->configured = 0;
+			CHAN->flags = 0U;
 			break;
 		case DEVT_CONNECTDONE: {
 			uint32_t spd = rd(DSTS) & DSTS_CONNECTSPD;
@@ -1771,7 +1801,7 @@ void imx95_dwc3_gadget_init(void)
 	CHAN->tx_tail = 0;
 	CHAN->rx_head = 0;
 	CHAN->rx_tail = 0;
-	CHAN->configured = 0;
+	CHAN->flags = 0U;
 	CHAN->magic = CONSOLE_CHAN_MAGIC;
 
 	gadget_start();
