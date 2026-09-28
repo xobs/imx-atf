@@ -352,6 +352,12 @@ void bl31_platform_setup(void)
 	ele_get_soc_info();
 
 	plat_imx9_scmi_setup();
+
+	/*
+	 * Last, so that everything a held board still has to do -- a reboot
+	 * request goes through SCMI -- is already set up.
+	 */
+	imx95_dwc3_hold_for_host();
 }
 
 entry_point_info_t *bl31_plat_get_next_image_ep_info(unsigned int type)

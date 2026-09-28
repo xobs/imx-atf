@@ -298,6 +298,32 @@ struct console_chan {
 
 #define CHAN ((volatile struct console_chan *)CONSOLE_CHAN_BASE)
 
+/*
+ * A host that starts the payload itself asks BL31 to hold BL33 back until it
+ * is reading the console: a probe's reset-halt, for a board booted over USB.
+ * Without it osdyne writes its first output, and drops it, before any host
+ * can be reading. The host finds the record by its magic.
+ */
+#define HOLD_MAGIC	"osdyne-hold-v1"
+
+struct hold_request {
+	char magic[16];		/* HOLD_MAGIC, zero-padded */
+	uint32_t hold;		/* non-zero: hold BL33 */
+	uint32_t reserved;
+};
+
+/*
+ * Written over SDP by odd, which starts the payload itself, before it jumps to
+ * the ATF container: the container is hashed, so the request cannot ride in
+ * the image. It sits in spare space at the end of the console window, which
+ * the channel never reaches, and is consumed at gadget init so that a later
+ * boot without the host is not held.
+ */
+#define HOLD_REQUEST_BASE	(CONSOLE_CHAN_BASE + 0xff00UL)
+#define HOLD_REQUEST ((volatile struct hold_request *)HOLD_REQUEST_BASE)
+
+static bool hold_requested;
+
 /* ------------------------------------------------------ low-level accessors */
 
 static inline uint32_t rd(uint32_t off)
@@ -1713,6 +1739,17 @@ void imx95_dwc3_service(void)
 }
 
 /* Platform PSCI system reset (imx95_psci.c) — SCMI full-reset via the SM. */
+void imx95_dwc3_hold_for_host(void)
+{
+	if (!(hold_requested))
+		return;
+
+	NOTICE("dwc3(el3): holding BL33 until the host reads the console\n");
+	while ((CHAN->flags & CHAN_HOST_READING) == 0U)
+		imx95_dwc3_service();
+	NOTICE("dwc3(el3): the host is reading the console; starting BL33\n");
+}
+
 void __dead2 imx_system_reset(void);
 
 void imx95_dwc3_disconnect(void)
@@ -1795,6 +1832,12 @@ void imx95_dwc3_gadget_init(void)
 	 */
 	memset((void *)(uintptr_t)MEM, 0, sizeof(struct dwc3_mem));
 	dcache_flush((uintptr_t)MEM, sizeof(struct dwc3_mem));
+
+	/* Take, and consume, the host's request to hold BL33 back. */
+	hold_requested = memcmp((const void *)(uintptr_t)HOLD_REQUEST->magic,
+				HOLD_MAGIC, sizeof(HOLD_MAGIC)) == 0 &&
+			 HOLD_REQUEST->hold != 0U;
+	memset((void *)(uintptr_t)HOLD_REQUEST, 0, sizeof(struct hold_request));
 
 	/* Initialise the EL1<->EL3 console channel before any traffic. */
 	CHAN->tx_head = 0;

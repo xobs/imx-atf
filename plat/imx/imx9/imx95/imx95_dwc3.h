@@ -13,6 +13,11 @@
 
 /* Bring the gadget up (call once from bl31_platform_setup, after GIC init). */
 void imx95_dwc3_gadget_init(void);
+/*
+ * Returns once the host is reading the console, if the host asked BL31 to hold
+ * BL33 back until then; at once otherwise.
+ */
+void imx95_dwc3_hold_for_host(void);
 
 /* Drain the DWC3 event ring; call from the EL3 FIQ handler for INTID 207. */
 void imx95_dwc3_service(void);
