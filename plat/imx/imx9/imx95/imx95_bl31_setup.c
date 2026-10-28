@@ -345,11 +345,11 @@ void bl31_platform_setup(void)
 	if (rc != 0)
 		panic();
 
+	/* get soc info, whose UID the gadget reports as its serial */
+	ele_get_soc_info();
+
 	/* Bring up the resident USB console gadget. */
 	imx95_dwc3_gadget_init();
-
-	/* get soc info */
-	ele_get_soc_info();
 
 	plat_imx9_scmi_setup();
 

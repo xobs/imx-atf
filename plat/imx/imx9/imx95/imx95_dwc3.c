@@ -33,6 +33,8 @@
 #include <lib/el3_runtime/context_mgmt.h>
 #include <plat/common/platform.h>
 
+#include <ele_api.h>
+
 #include "imx95_dwc3.h"
 
 /* ------------------------------------------------------------------ bases */
@@ -283,9 +285,36 @@ static const uint8_t STR_PRODUCT[30] = {
 	0x1e, DESC_STRING, 'o', 0, 's', 0, 'd', 0, 'y', 0, 'n', 0, 'e', 0,
 	' ', 0, 'c', 0, 'o', 0, 'n', 0, 's', 0, 'o', 0, 'l', 0, 'e', 0,
 };
-static const uint8_t STR_SERIAL[10] = {
+/*
+ * The chip UID as the boot ROM reports it (its first 8 bytes, in order), so
+ * that one serial names a board whether it is in the ROM or running.  "0001"
+ * if ELE gave none.  bLength is [0].
+ */
+extern struct ele_soc_info soc_info;
+
+#define UID_BYTES	8U
+static uint8_t str_serial[2U + (4U * UID_BYTES)] = {
 	0x0a, DESC_STRING, '0', 0, '0', 0, '0', 0, '1', 0,
 };
+
+static void serial_from_uid(void)
+{
+	static const char digits[] = "0123456789ABCDEF";
+	const uint8_t *uid = (const uint8_t *)soc_info.uid;
+	unsigned int i;
+
+	inv_dcache_range((uintptr_t)&soc_info, sizeof(soc_info));
+	if ((soc_info.uid[0] | soc_info.uid[1]) == 0U) {
+		return;
+	}
+	for (i = 0U; i < UID_BYTES; i++) {
+		str_serial[2U + (4U * i)] = (uint8_t)digits[uid[i] >> 4];
+		str_serial[3U + (4U * i)] = 0U;
+		str_serial[4U + (4U * i)] = (uint8_t)digits[uid[i] & 0xfU];
+		str_serial[5U + (4U * i)] = 0U;
+	}
+	str_serial[0] = (uint8_t)sizeof(str_serial);
+}
 static const uint8_t MS_OS_STRING[18] = {
 	0x12, DESC_STRING, 'M', 0, 'S', 0, 'F', 0, 'T', 0,
 	'1', 0, '0', 0, '0', 0, MS_VENDOR_CODE, 0x00,
@@ -1461,7 +1490,7 @@ static int handle_setup(uint8_t bmreq, uint8_t brequest, uint16_t wvalue,
 				case 2:
 					return stage_reply(STR_PRODUCT, sizeof(STR_PRODUCT), wlen);
 				case 3:
-					return stage_reply(STR_SERIAL, sizeof(STR_SERIAL), wlen);
+					return stage_reply(str_serial, str_serial[0], wlen);
 				case MS_OS_STRING_INDEX:
 					return stage_reply(MS_OS_STRING, sizeof(MS_OS_STRING), wlen);
 				default:
@@ -1977,6 +2006,7 @@ void imx95_dwc3_gadget_init(void)
 {
 	ep0_state = EP0_STATE_SETUP;
 	evt_idx = 0;
+	serial_from_uid();
 
 	/*
 	 * Zero the DWC3 DMA structures (event ring, TRBs, setup/EP0/EP1 buffers).
