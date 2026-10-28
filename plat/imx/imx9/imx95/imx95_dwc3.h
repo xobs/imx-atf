@@ -19,6 +19,12 @@ void imx95_dwc3_gadget_init(void);
  */
 void imx95_dwc3_hold_for_host(void);
 
+/*
+ * Stops BL33 at its first instruction, in the debug monitor, if the host that
+ * loaded this image asked for that. Call once BL33's entry context exists.
+ */
+void imx95_dwc3_halt_at_entry(void);
+
 /* Drain the DWC3 event ring; call from the EL3 FIQ handler for INTID 207. */
 void imx95_dwc3_service(void);
 

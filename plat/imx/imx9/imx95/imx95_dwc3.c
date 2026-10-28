@@ -221,6 +221,7 @@
 #define INFO_CAP_CONSOLE_READING (1U << 4)	/* VENDOR_REQ_CONSOLE_READING */
 #define INFO_CAP_HOLD		(1U << 5)	/* struct hold_request */
 #define INFO_CAP_REGS_WRITE	(1U << 6)	/* VENDOR_REQ_REGS_WRITE */
+#define INFO_CAP_HALT_AT_ENTRY	(1U << 7)	/* HOLD_AT_ENTRY */
 
 /* Reply to VENDOR_REQ_GET_INFO.  Little-endian, naturally aligned, no padding. */
 struct gadget_info {
@@ -356,9 +357,17 @@ struct console_chan {
 
 struct hold_request {
 	char magic[16];		/* HOLD_MAGIC, zero-padded */
-	uint32_t hold;		/* non-zero: hold BL33 */
+	uint32_t hold;		/* HOLD_*: what to hold BL33 back for */
 	uint32_t reserved;
 };
+
+/* Until the host reads the console. */
+#define HOLD_FOR_CONSOLE	1U
+/*
+ * Stopped in the debug monitor at BL33's first instruction, as a probe's
+ * reset-halt would leave it: see imx95_dwc3_halt_at_entry().
+ */
+#define HOLD_AT_ENTRY		2U
 
 /*
  * Written over SDP by odd, which starts the payload itself, before it jumps to
@@ -370,7 +379,8 @@ struct hold_request {
 #define HOLD_REQUEST_BASE	(CONSOLE_CHAN_BASE + 0xff00UL)
 #define HOLD_REQUEST ((volatile struct hold_request *)HOLD_REQUEST_BASE)
 
-static bool hold_requested;
+/* The host's request, taken at gadget init: one of the HOLD_* modes, or 0. */
+static uint32_t hold_mode;
 
 /* ------------------------------------------------------ low-level accessors */
 
@@ -1409,7 +1419,7 @@ static uint32_t fill_info(void *out)
 	info.length = (uint16_t)sizeof(info);
 	info.caps = INFO_CAP_CONSOLE | INFO_CAP_MEMORY | INFO_CAP_REBOOT |
 		    INFO_CAP_DEBUG_MONITOR | INFO_CAP_CONSOLE_READING |
-		    INFO_CAP_HOLD | INFO_CAP_REGS_WRITE;
+		    INFO_CAP_HOLD | INFO_CAP_REGS_WRITE | INFO_CAP_HALT_AT_ENTRY;
 	memcpy(info.chip, INFO_CHIP, sizeof(INFO_CHIP) - 1U);
 
 	memcpy(out, &info, sizeof(info));
@@ -1864,9 +1874,25 @@ void imx95_dwc3_service(void)
 }
 
 /* Platform PSCI system reset (imx95_psci.c) — SCMI full-reset via the SM. */
+void imx95_dwc3_halt_at_entry(void)
+{
+	if ((hold_mode != HOLD_AT_ENTRY) || !dwc3_ready)
+		return;
+
+	/*
+	 * BL31 has built BL33's entry context by now, so the monitor stops on
+	 * its first instruction, and a host can set registers before it runs.
+	 */
+	NOTICE("dwc3(el3): stopping at BL33's entry for the host\n");
+	dbg_ns_context = cm_get_context(NON_SECURE);
+	dbg_stop_reason = DBG_REASON_HOST;
+	dbg_stop_requested = true;
+	(void)dbg_park();
+}
+
 void imx95_dwc3_hold_for_host(void)
 {
-	if (!(hold_requested))
+	if (hold_mode != HOLD_FOR_CONSOLE)
 		return;
 
 	NOTICE("dwc3(el3): holding BL33 until the host reads the console\n");
@@ -1959,9 +1985,9 @@ void imx95_dwc3_gadget_init(void)
 	dcache_flush((uintptr_t)MEM, sizeof(struct dwc3_mem));
 
 	/* Take, and consume, the host's request to hold BL33 back. */
-	hold_requested = memcmp((const void *)(uintptr_t)HOLD_REQUEST->magic,
-				HOLD_MAGIC, sizeof(HOLD_MAGIC)) == 0 &&
-			 HOLD_REQUEST->hold != 0U;
+	hold_mode = (memcmp((const void *)(uintptr_t)HOLD_REQUEST->magic,
+			    HOLD_MAGIC, sizeof(HOLD_MAGIC)) == 0) ?
+		    HOLD_REQUEST->hold : 0U;
 	memset((void *)(uintptr_t)HOLD_REQUEST, 0, sizeof(struct hold_request));
 
 	/* Initialise the EL1<->EL3 console channel before any traffic. */

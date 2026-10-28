@@ -360,6 +360,12 @@ void bl31_platform_setup(void)
 	imx95_dwc3_hold_for_host();
 }
 
+/* Runs once BL33's entry context is built, just before BL31 enters it. */
+void bl31_plat_runtime_setup(void)
+{
+	imx95_dwc3_halt_at_entry();
+}
+
 entry_point_info_t *bl31_plat_get_next_image_ep_info(unsigned int type)
 {
 	if (type == NON_SECURE)
