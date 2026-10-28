@@ -197,6 +197,17 @@
  * that predates the request stalls it, which is how a host tells.
  */
 #define VENDOR_REQ_GET_INFO	0x0f
+/*
+ * Write one register of the stopped core: wValue picks it, numbered as
+ * VENDOR_REQ_REGS and VENDOR_REQ_STATUS report them -- x0..x30, then 31 for
+ * SP, 32 for PC and 33 for PSTATE -- and the OUT data stage is its new value.
+ * STALLs unless the saved context is the interrupted code's own; see
+ * dbg_regs_writable().
+ */
+#define VENDOR_REQ_REGS_WRITE	0x10
+#define DBG_REG_SP		31U
+#define DBG_REG_PC		32U
+#define DBG_REG_PSTATE		33U
 
 #define INFO_MAGIC		"osdg"
 #define INFO_VERSION		1U
@@ -209,6 +220,7 @@
 #define INFO_CAP_DEBUG_MONITOR	(1U << 3)	/* VENDOR_REQ_STOP..._DEBUG_CAPS */
 #define INFO_CAP_CONSOLE_READING (1U << 4)	/* VENDOR_REQ_CONSOLE_READING */
 #define INFO_CAP_HOLD		(1U << 5)	/* struct hold_request */
+#define INFO_CAP_REGS_WRITE	(1U << 6)	/* VENDOR_REQ_REGS_WRITE */
 
 /* Reply to VENDOR_REQ_GET_INFO.  Little-endian, naturally aligned, no padding. */
 struct gadget_info {
@@ -794,6 +806,46 @@ static uint32_t dbg_fill_regs(void *out)
 	return 31U * (uint32_t)sizeof(uint64_t);
 }
 
+/*
+ * Whether VENDOR_REQ_REGS_WRITE may change the saved context.  Only when it is
+ * the interrupted code's own: a host stop or an external abort.  A stop the
+ * payload reported holds its exception handler's registers, and writing those
+ * would change nothing the faulting code sees.
+ */
+static bool dbg_regs_writable(void)
+{
+	return dbg_stopped && (dbg_ns_context != NULL) && (dbg_fault_pc == 0U) &&
+	       (dbg_stop_reason != DBG_REASON_EL3_PANIC);
+}
+
+/* The register VENDOR_REQ_REGS_WRITE's data stage is for. */
+static uint16_t dbg_reg_pending;
+
+static void dbg_write_reg(unsigned int reg, uint64_t value)
+{
+	el3_state_t *st = get_el3state_ctx(dbg_ns_context);
+	uint64_t spsr = read_ctx_reg(st, CTX_SPSR_EL3);
+
+	if (reg < 31U) {
+		write_ctx_reg(get_gpregs_ctx(dbg_ns_context),
+			      CTX_GPREG_X0 + (reg * 8U), value);
+	} else if (reg == DBG_REG_SP) {
+		/* The stack dbg_fill_status reports, for the same reason. */
+		if ((spsr & 0xfU) == 0x5U) {
+			write_sp_el1(value);
+		} else {
+			write_ctx_reg(get_gpregs_ctx(dbg_ns_context),
+				      CTX_GPREG_SP_EL0, value);
+		}
+	} else if (reg == DBG_REG_PC) {
+		write_ctx_reg(st, CTX_ELR_EL3, value);
+	} else if (reg == DBG_REG_PSTATE) {
+		/* PSTATE is 32 bits; keep SPSR_EL3's upper half as it is. */
+		write_ctx_reg(st, CTX_SPSR_EL3,
+			      (spsr & ~ULL(0xffffffff)) | (value & ULL(0xffffffff)));
+	}
+}
+
 /* ------------------------------------------------- self-hosted debug */
 
 /*
@@ -1357,7 +1409,7 @@ static uint32_t fill_info(void *out)
 	info.length = (uint16_t)sizeof(info);
 	info.caps = INFO_CAP_CONSOLE | INFO_CAP_MEMORY | INFO_CAP_REBOOT |
 		    INFO_CAP_DEBUG_MONITOR | INFO_CAP_CONSOLE_READING |
-		    INFO_CAP_HOLD;
+		    INFO_CAP_HOLD | INFO_CAP_REGS_WRITE;
 	memcpy(info.chip, INFO_CHIP, sizeof(INFO_CHIP) - 1U);
 
 	memcpy(out, &info, sizeof(info));
@@ -1486,6 +1538,14 @@ static int handle_setup(uint8_t bmreq, uint8_t brequest, uint16_t wvalue,
 
 			dcache_flush((uintptr_t)MEM->ep0_data, n);
 			return wlen < n ? wlen : n;
+		}
+		if (brequest == VENDOR_REQ_REGS_WRITE && (bmreq & 0x80U) == 0U) {
+			if ((wlen != sizeof(uint64_t)) || (wvalue > DBG_REG_PSTATE) ||
+			    !dbg_regs_writable())
+				return -1;
+			dbg_reg_pending = wvalue;
+			dbg_arg_pending = brequest;
+			return (int)wlen;
 		}
 		if (brequest == VENDOR_REQ_DEBUG_CAPS && (bmreq & 0x80U) != 0U) {
 			uint32_t n = dbg_fill_caps((void *)MEM->ep0_data);
@@ -1650,6 +1710,9 @@ static void handle_ep0_xfercomplete(unsigned int ep)
 				break;
 			case VENDOR_REQ_CLEAR_WP:
 				(void)dbg_clear_wp(addr, false);
+				break;
+			case VENDOR_REQ_REGS_WRITE:
+				dbg_write_reg(dbg_reg_pending, addr);
 				break;
 			default:
 				break;
