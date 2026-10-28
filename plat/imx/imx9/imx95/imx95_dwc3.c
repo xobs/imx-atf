@@ -1749,7 +1749,13 @@ static void handle_ep0_xfernotready(unsigned int ep, uint32_t estatus)
 {
 	uint32_t phase = estatus & 0x3;
 
-	if (phase == DEPEVT_STATUS_CONTROL_DATA && ep0_state == EP0_STATE_SETUP) {
+	/*
+	 * Only for a transfer that has a data stage: after a STALL the host may
+	 * still send the IN tokens that raise this, and answering them would
+	 * leave the next SETUP handled as data.
+	 */
+	if (phase == DEPEVT_STATUS_CONTROL_DATA && ep0_state == EP0_STATE_SETUP &&
+	    ep0_three_stage) {
 		unsigned int data_ep = ep0_dir_in ? EP0_IN : EP0_OUT;
 		uint32_t n = ep0_dir_in ? ep0_resp_len : 512;
 		if (!ep_busy[data_ep]) {
