@@ -189,6 +189,42 @@
  * so cannot leave osdyne waiting on a ring nobody will drain.
  */
 #define VENDOR_REQ_CONSOLE_READING	0x0e
+/*
+ * What this gadget is and what it can do, so that one host tool can serve the
+ * gadget on every SoC it has been ported to (odd's bl31_gadget module) without
+ * telling them apart by USB id.  The reply is struct gadget_info: later
+ * versions only append to it, and a host reads as far as it knows.  Firmware
+ * that predates the request stalls it, which is how a host tells.
+ */
+#define VENDOR_REQ_GET_INFO	0x0f
+
+#define INFO_MAGIC		"osdg"
+#define INFO_VERSION		1U
+/* The chip as osdyne's targets name it. */
+#define INFO_CHIP		"MIMX95"
+
+#define INFO_CAP_CONSOLE	(1U << 0)	/* osdyne's console on EP1 IN */
+#define INFO_CAP_MEMORY		(1U << 1)	/* VENDOR_REQ_MEM_READ/_WRITE */
+#define INFO_CAP_REBOOT		(1U << 2)	/* VENDOR_REQ_REBOOT */
+#define INFO_CAP_DEBUG_MONITOR	(1U << 3)	/* VENDOR_REQ_STOP..._DEBUG_CAPS */
+#define INFO_CAP_CONSOLE_READING (1U << 4)	/* VENDOR_REQ_CONSOLE_READING */
+#define INFO_CAP_HOLD		(1U << 5)	/* struct hold_request */
+
+/* Reply to VENDOR_REQ_GET_INFO.  Little-endian, naturally aligned, no padding. */
+struct gadget_info {
+	char magic[4];		/* INFO_MAGIC, not NUL-terminated */
+	uint16_t version;	/* INFO_VERSION */
+	uint16_t length;	/* sizeof(struct gadget_info) */
+	uint32_t caps;		/* INFO_CAP_* */
+	char chip[16];		/* INFO_CHIP, NUL-padded */
+	uint32_t reserved;
+	/*
+	 * Where BL31 would load a BL33 the host sends it; both 0, since this
+	 * one does not take one.
+	 */
+	uint64_t bl33_base;
+	uint64_t bl33_size;
+};
 
 /*
  * wValue on VENDOR_REQ_RESUME: 0 resumes where the debuggee stopped, 1 steps
@@ -1308,6 +1344,26 @@ static void mem_write_range(uintptr_t addr, const uint8_t *src, uint32_t len)
 	}
 }
 
+static uint32_t fill_info(void *out)
+{
+	struct gadget_info info;
+
+	_Static_assert(sizeof(struct gadget_info) == 48U,
+		       "struct gadget_info is part of the USB protocol");
+
+	memset(&info, 0, sizeof(info));
+	memcpy(info.magic, INFO_MAGIC, sizeof(info.magic));
+	info.version = INFO_VERSION;
+	info.length = (uint16_t)sizeof(info);
+	info.caps = INFO_CAP_CONSOLE | INFO_CAP_MEMORY | INFO_CAP_REBOOT |
+		    INFO_CAP_DEBUG_MONITOR | INFO_CAP_CONSOLE_READING |
+		    INFO_CAP_HOLD;
+	memcpy(info.chip, INFO_CHIP, sizeof(INFO_CHIP) - 1U);
+
+	memcpy(out, &info, sizeof(info));
+	return (uint32_t)sizeof(info);
+}
+
 /*
  * Decode a SETUP packet. Returns >= 0 for the data/no-data length (staged in
  * ep0_data), or -1 to STALL.
@@ -1433,6 +1489,12 @@ static int handle_setup(uint8_t bmreq, uint8_t brequest, uint16_t wvalue,
 		}
 		if (brequest == VENDOR_REQ_DEBUG_CAPS && (bmreq & 0x80U) != 0U) {
 			uint32_t n = dbg_fill_caps((void *)MEM->ep0_data);
+
+			dcache_flush((uintptr_t)MEM->ep0_data, n);
+			return wlen < n ? wlen : n;
+		}
+		if (brequest == VENDOR_REQ_GET_INFO && (bmreq & 0x80U) != 0U) {
+			uint32_t n = fill_info((void *)MEM->ep0_data);
 
 			dcache_flush((uintptr_t)MEM->ep0_data, n);
 			return wlen < n ? wlen : n;
