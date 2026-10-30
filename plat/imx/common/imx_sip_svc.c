@@ -54,6 +54,12 @@ static uintptr_t imx_sip_handler(unsigned int smc_fid,
 		 * osdyne debugs itself, so in practice these arrive as the
 		 * same-EL form (0x31/0x33/0x35); the lower-EL ones are accepted
 		 * for a kernel that one day runs something beneath it.
+		 *
+		 * x3 is the faulting PC and x4 the physical address of the
+		 * faulting code's registers (struct dbg_frame), or 0.  The
+		 * registers saved at this SMC are osdyne's handler's, so the
+		 * frame is what the host is shown.  A payload that predates
+		 * frames leaves x4 undefined; the monitor checks it.
 		 */
 		unsigned int reason;
 		bool skip;
@@ -80,7 +86,8 @@ static uintptr_t imx_sip_handler(unsigned int smc_fid,
 		}
 
 		skip = imx95_dwc3_debug_fault(reason, NULL, (uint64_t)x1,
-					      (uint64_t)x2, (uint64_t)x3);
+					      (uint64_t)x2, (uint64_t)x3,
+					      (uint64_t)x4);
 		SMC_RET2(handle, 0, skip ? 1UL : 0UL);
 		break;
 	}

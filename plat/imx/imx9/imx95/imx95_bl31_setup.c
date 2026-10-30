@@ -242,7 +242,7 @@ void plat_ea_handler(unsigned int ea_reason, uint64_t syndrome, void *cookie,
 	 * abort was synchronous and precise, so ELR_EL3 is the aborting
 	 * instruction and A64 instructions are all four bytes.
 	 */
-	if (imx95_dwc3_debug_fault(reason, handle, syndrome, far, 0U) &&
+	if (imx95_dwc3_debug_fault(reason, handle, syndrome, far, 0U, 0U) &&
 	    (reason == DBG_REASON_EA_SYNC)) {
 		el3_state_t *st = get_el3state_ctx(handle);
 
@@ -260,7 +260,7 @@ void __dead2 plat_panic_handler(void)
 {
 	while (imx95_dwc3_debug_ready()) {
 		(void)imx95_dwc3_debug_fault(DBG_REASON_EL3_PANIC, NULL,
-					     0U, 0U, 0U);
+					     0U, 0U, 0U, 0U);
 	}
 
 	/* Panicked before the gadget came up; nothing can be inspected. */

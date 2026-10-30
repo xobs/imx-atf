@@ -26,6 +26,7 @@
 #include <arch_helpers.h>
 #include <common/debug.h>
 #include <drivers/delay_timer.h>
+#include <lib/cassert.h>
 #include <lib/mmio.h>
 #include <lib/xlat_tables/xlat_tables_v2.h>
 
@@ -203,7 +204,7 @@
  * Write one register of the stopped core: wValue picks it, numbered as
  * VENDOR_REQ_REGS and VENDOR_REQ_STATUS report them -- x0..x30, then 31 for
  * SP, 32 for PC and 33 for PSTATE -- and the OUT data stage is its new value.
- * STALLs unless the saved context is the interrupted code's own; see
+ * STALLs unless the registers BL31 holds are the interrupted code's own; see
  * dbg_regs_writable().
  */
 #define VENDOR_REQ_REGS_WRITE	0x10
@@ -770,12 +771,51 @@ static volatile bool dwc3_ready;
  */
 static void *dbg_ns_context;
 
+/*
+ * The registers of the code that took a debug exception, as osdyne hands them
+ * over with IMX_SIP_DEBUG_FAULT.  The exception reaches osdyne's handler, not
+ * EL3, so by the time osdyne reports it the context TF-A saved at the SMC is
+ * the handler's.  osdyne passes the physical address of one of these in x4,
+ * and while the core is stopped the monitor serves register reads and writes
+ * from it instead; on resume it is written back, and osdyne resumes the
+ * interrupted code from it.
+ *
+ * The layout is osdyne's DebugFrame (os/kernel/src/platform/arch/aarch64/
+ * context.rs).  Little-endian:
+ *
+ *   0    magic, DBG_FRAME_MAGIC
+ *   4    size of the frame in bytes; later versions only append
+ *   8    x0..x30
+ *   256  sp, the stack pointer the interrupted code was using
+ *   264  pc
+ *   272  pstate, in SPSR form
+ */
+#define DBG_FRAME_MAGIC		U(0x6664736f)	/* "osdf" */
+
+struct dbg_frame {
+	uint32_t magic;
+	uint32_t size;
+	uint64_t x[31];
+	uint64_t sp;
+	uint64_t pc;
+	uint64_t pstate;
+};
+
+CASSERT(sizeof(struct dbg_frame) == 280U, assert_dbg_frame_size);
+
+/*
+ * A copy of the payload's frame while the stop it came with lasts, and where
+ * it goes back to; dbg_frame_addr is 0 when the stop has none.
+ */
+static struct dbg_frame dbg_frame;
+static uintptr_t dbg_frame_addr;
+
 /* Layout of the VENDOR_REQ_STATUS reply.  Little-endian, packed. */
 struct dbg_status {
 	uint32_t stopped;
 	uint32_t reason;
-	uint64_t pc;    /* ELR_EL3: where the non-secure world will resume */
-	uint64_t spsr;  /* SPSR_EL3: its exception level and interrupt masks */
+	uint64_t pc;    /* where the debuggee will resume */
+	uint64_t spsr;  /* its PSTATE: exception level and interrupt masks */
 	uint64_t sp;    /* the stack the debuggee is actually using */
 	uint64_t esr;   /* fault syndrome, 0 when the stop was not a fault */
 	uint64_t far;   /* faulting address, where the syndrome provides one */
@@ -792,6 +832,14 @@ static uint32_t dbg_fill_status(void *out)
 		.esr = dbg_fault_esr,
 		.far = dbg_fault_far,
 	};
+
+	if (dbg_frame_addr != 0U) {
+		st.pc = dbg_frame.pc;
+		st.spsr = dbg_frame.pstate;
+		st.sp = dbg_frame.sp;
+		memcpy(out, &st, sizeof(st));
+		return (uint32_t)sizeof(st);
+	}
 
 	if (dbg_ns_context != NULL) {
 		st.pc = read_ctx_reg(get_el3state_ctx(dbg_ns_context), CTX_ELR_EL3);
@@ -832,6 +880,11 @@ static uint32_t dbg_fill_regs(void *out)
 	uint64_t *dst = (uint64_t *)out;
 	unsigned int i;
 
+	if (dbg_frame_addr != 0U) {
+		memcpy(out, dbg_frame.x, sizeof(dbg_frame.x));
+		return (uint32_t)sizeof(dbg_frame.x);
+	}
+
 	if (dbg_ns_context == NULL) {
 		memset(out, 0, 31U * sizeof(uint64_t));
 		return 31U * (uint32_t)sizeof(uint64_t);
@@ -846,15 +899,23 @@ static uint32_t dbg_fill_regs(void *out)
 }
 
 /*
- * Whether VENDOR_REQ_REGS_WRITE may change the saved context.  Only when it is
- * the interrupted code's own: a host stop or an external abort.  A stop the
- * payload reported holds its exception handler's registers, and writing those
- * would change nothing the faulting code sees.
+ * Whether VENDOR_REQ_REGS_WRITE may change the registers.  Only when they are
+ * the interrupted code's own: a host stop, an external abort, or a stop the
+ * payload reported with a frame.  Without a frame, such a stop holds the
+ * payload's exception handler's registers, and writing those would change
+ * nothing the faulting code sees.
  */
 static bool dbg_regs_writable(void)
 {
-	return dbg_stopped && (dbg_ns_context != NULL) && (dbg_fault_pc == 0U) &&
-	       (dbg_stop_reason != DBG_REASON_EL3_PANIC);
+	if (!dbg_stopped || (dbg_stop_reason == DBG_REASON_EL3_PANIC)) {
+		return false;
+	}
+
+	if (dbg_frame_addr != 0U) {
+		return true;
+	}
+
+	return (dbg_ns_context != NULL) && (dbg_fault_pc == 0U);
 }
 
 /* The register VENDOR_REQ_REGS_WRITE's data stage is for. */
@@ -862,8 +923,25 @@ static uint16_t dbg_reg_pending;
 
 static void dbg_write_reg(unsigned int reg, uint64_t value)
 {
-	el3_state_t *st = get_el3state_ctx(dbg_ns_context);
-	uint64_t spsr = read_ctx_reg(st, CTX_SPSR_EL3);
+	el3_state_t *st;
+	uint64_t spsr;
+
+	if (dbg_frame_addr != 0U) {
+		if (reg < 31U) {
+			dbg_frame.x[reg] = value;
+		} else if (reg == DBG_REG_SP) {
+			dbg_frame.sp = value;
+		} else if (reg == DBG_REG_PC) {
+			dbg_frame.pc = value;
+		} else if (reg == DBG_REG_PSTATE) {
+			dbg_frame.pstate = (dbg_frame.pstate & ~ULL(0xffffffff)) |
+					   (value & ULL(0xffffffff));
+		}
+		return;
+	}
+
+	st = get_el3state_ctx(dbg_ns_context);
+	spsr = read_ctx_reg(st, CTX_SPSR_EL3);
 
 	if (reg < 31U) {
 		write_ctx_reg(get_gpregs_ctx(dbg_ns_context),
@@ -942,7 +1020,9 @@ static uint64_t dbg_el_control(void)
 	uint64_t spsr = 0U;
 	unsigned int el;
 
-	if (dbg_ns_context != NULL) {
+	if (dbg_frame_addr != 0U) {
+		spsr = dbg_frame.pstate;
+	} else if (dbg_ns_context != NULL) {
 		spsr = read_ctx_reg(get_el3state_ctx(dbg_ns_context),
 				    CTX_SPSR_EL3);
 	}
@@ -1241,17 +1321,38 @@ static uint32_t dbg_fill_caps(void *out)
 static bool dbg_park(void)
 {
 	bool skip;
+	bool held = false;
 
 	while (dbg_stop_requested) {
+		held = true;
 		dbg_stopped = true;
 		imx95_dwc3_service();
 	}
 
 	skip = dbg_resume_skip;
 
-	if (dbg_ns_context != NULL) {
-		el3_state_t *st = get_el3state_ctx(dbg_ns_context);
-		uint64_t spsr = read_ctx_reg(st, CTX_SPSR_EL3);
+	/*
+	 * Only a resume from a stop arms anything.  Every gadget FIQ passes
+	 * through here, and it can land anywhere -- an FIQ routed to EL3 is
+	 * taken even where the payload masks interrupts, such as in the
+	 * exception handler a fault report has just returned to.  A step still
+	 * pending from the last resume, armed again there, would step that
+	 * handler instead of the code the host asked to step.
+	 *
+	 * With a frame, the PSTATE to resume with is the interrupted code's,
+	 * which osdyne restores from the frame; SPSR_EL3 only returns to its
+	 * handler, which runs with debug exceptions masked either way.
+	 */
+	if (held && ((dbg_frame_addr != 0U) || (dbg_ns_context != NULL))) {
+		el3_state_t *st = NULL;
+		uint64_t spsr;
+
+		if (dbg_frame_addr != 0U) {
+			spsr = dbg_frame.pstate;
+		} else {
+			st = get_el3state_ctx(dbg_ns_context);
+			spsr = read_ctx_reg(st, CTX_SPSR_EL3);
+		}
 
 		/*
 		 * BL31 hands the payload PSTATE.D set, which masks debug
@@ -1276,8 +1377,16 @@ static bool dbg_park(void)
 			spsr |= SPSR_SS_BIT;
 		}
 
-		write_ctx_reg(st, CTX_SPSR_EL3, spsr);
+		if (dbg_frame_addr != 0U) {
+			dbg_frame.pstate = spsr;
+			memcpy((void *)dbg_frame_addr, &dbg_frame,
+			       sizeof(dbg_frame));
+		} else {
+			write_ctx_reg(st, CTX_SPSR_EL3, spsr);
+		}
 	}
+
+	dbg_frame_addr = 0U;
 
 	dbg_resume_skip = false;
 	dbg_stopped = false;
@@ -1289,8 +1398,47 @@ static bool dbg_park(void)
 	return skip;
 }
 
+/*
+ * Take a copy of the frame the payload passed, if it passed one: x4 is not
+ * part of the call for a payload that predates frames, so whatever it holds
+ * has to prove itself.  It must be non-secure, writable normal memory, so
+ * that a bad address cannot have the monitor write the host's values into
+ * BL31's own memory, and it must start with the magic.
+ */
+static void dbg_frame_load(uint64_t addr)
+{
+	uintptr_t page;
+
+	dbg_frame_addr = 0U;
+
+	if ((addr == 0U) || ((addr & 7U) != 0U) ||
+	    ((addr + sizeof(dbg_frame)) < addr)) {
+		return;
+	}
+
+	for (page = addr & ~0xFFFUL; page < (addr + sizeof(dbg_frame));
+	     page += 0x1000UL) {
+		uint32_t attr;
+
+		if ((xlat_get_mem_attributes(page, &attr) != 0) ||
+		    (MT_TYPE(attr) != MT_MEMORY) || ((attr & MT_RW) == 0U) ||
+		    ((attr & MT_NS) == 0U)) {
+			return;
+		}
+	}
+
+	memcpy(&dbg_frame, (const void *)addr, sizeof(dbg_frame));
+	if ((dbg_frame.magic != DBG_FRAME_MAGIC) ||
+	    (dbg_frame.size < sizeof(dbg_frame))) {
+		return;
+	}
+
+	dbg_frame_addr = (uintptr_t)addr;
+}
+
 bool imx95_dwc3_debug_fault(unsigned int reason, void *handle,
-				 uint64_t esr, uint64_t far, uint64_t pc)
+			    uint64_t esr, uint64_t far, uint64_t pc,
+			    uint64_t frame)
 {
 	/*
 	 * An SMC handler is not given the interrupted context, but TF-A has
@@ -1311,6 +1459,7 @@ bool imx95_dwc3_debug_fault(unsigned int reason, void *handle,
 	dbg_fault_far = far;
 	dbg_fault_pc = pc;
 	dbg_stop_reason = reason;
+	dbg_frame_load(frame);
 
 	/*
 	 * A step has happened, so disarm before parking.  Leaving it armed

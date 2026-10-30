@@ -67,9 +67,14 @@ void __dead2 imx95_dwc3_do_reboot(void);
  * @pc, when non-zero, overrides the reported PC: for a fault reported by
  * osdyne the interesting address is where it faulted, not where its handler
  * happened to call us from.
+ * @frame, when non-zero, is the physical address of the registers of the code
+ * that faulted, as osdyne hands them over (struct dbg_frame in imx95_dwc3.c).
+ * The host is shown, and may change, those rather than the handler's; they
+ * are written back before this returns.  It is checked before it is trusted.
  */
 bool imx95_dwc3_debug_fault(unsigned int reason, void *handle,
-			    uint64_t esr, uint64_t far, uint64_t pc);
+			    uint64_t esr, uint64_t far, uint64_t pc,
+			    uint64_t frame);
 
 /*
  * Whether the gadget is up.  A fault before it is has nowhere to report to;
