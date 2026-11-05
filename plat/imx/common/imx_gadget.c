@@ -386,6 +386,9 @@ static bool gadget_started;
 /* The controller's GIC interrupt, delivered as a Group-0 FIQ to EL3. */
 static unsigned int gadget_intid;
 
+/* The EL3 interrupts that are not the gadget's go here; see imx_gadget_chain_fiq(). */
+static interrupt_type_handler_t chained_fiq;
+
 /*
  * The non-secure context TF-A saved when it took the interrupt that brought us
  * into EL3.  This is what makes a stub debugger practical here: the registers
@@ -1625,6 +1628,12 @@ void imx_gadget_ep0_status_done(void)
 		configured = true;
 		CHAN->flags = CHAN_CONFIGURED;
 		config_pending = false;
+		/*
+		 * Send what osdyne wrote before there was a host to send it to.
+		 * Nothing else would until osdyne writes more or kicks again: a
+		 * ChipIdea raises nothing for the host polling an idle endpoint.
+		 */
+		imx_gadget_ctrl_tx_pump();
 	}
 }
 
@@ -1705,7 +1714,18 @@ void imx_gadget_console_kick(void)
 static uint64_t imx_gadget_fiq_handler(uint32_t id, uint32_t flags,
 				       void *handle, void *cookie)
 {
-	uint32_t irq = plat_ic_acknowledge_interrupt();
+	uint32_t irq;
+
+	/*
+	 * Look before acknowledging: an interrupt that is not the gadget's
+	 * goes to the chained handler, which acknowledges it itself.
+	 */
+	if ((chained_fiq != NULL) &&
+	    (plat_ic_get_pending_interrupt_id() != gadget_intid)) {
+		return chained_fiq(id, flags, handle, cookie);
+	}
+
+	irq = plat_ic_acknowledge_interrupt();
 
 	if (irq == gadget_intid) {
 		/*
@@ -1729,6 +1749,11 @@ static uint64_t imx_gadget_fiq_handler(uint32_t id, uint32_t flags,
 		plat_ic_end_of_interrupt(irq);
 
 	return 0;
+}
+
+void imx_gadget_chain_fiq(interrupt_type_handler_t handler)
+{
+	chained_fiq = handler;
 }
 
 /*

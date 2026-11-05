@@ -12,12 +12,22 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <bl31/interrupt_mgmt.h>
+
 /*
  * Bring the gadget up. Call once from bl31_platform_setup, after the GIC is
  * initialised and the SoC info (whose UID is the serial) has been read.
  * @intid is the controller's GIC interrupt, which becomes a Group-0 FIQ to EL3.
  */
 void imx_gadget_init(unsigned int intid);
+
+/*
+ * TF-A keeps one handler for EL3 interrupts, which the gadget takes.  Code
+ * that needs EL3 interrupts of its own hands its handler here instead of
+ * registering it, before imx_gadget_init(), and is called for every EL3
+ * interrupt that is not the gadget's, to acknowledge and handle as it would.
+ */
+void imx_gadget_chain_fiq(interrupt_type_handler_t handler);
 
 /*
  * Returns once the host is reading the console, if the host asked BL31 to hold

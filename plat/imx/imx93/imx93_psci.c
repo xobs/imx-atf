@@ -18,6 +18,7 @@
 #include "../drivers/arm/gic/v3/gicv3_private.h"
 
 #include <plat_imx8.h>
+#include <imx_gadget.h>
 #include <pwr_ctrl.h>
 #include <sema42.h>
 
@@ -912,6 +913,13 @@ void imx_get_sys_suspend_power_state(psci_power_state_t *req_state)
 
 void __dead2 imx_system_reset(void)
 {
+	/*
+	 * Drop osdyne's USB gadget off the bus first, so the host sees a clean
+	 * unplug and the boot ROM's serial-download gadget can enumerate after
+	 * the reset.
+	 */
+	imx_gadget_disconnect();
+
 	mmio_write_32(WDOG3_BASE + WDOG_CNT, 0xd928c520);
 	while ((mmio_read_32(WDOG3_BASE + WDOG_CS) & WDOG_CS_ULK) == 0U) {
 		;

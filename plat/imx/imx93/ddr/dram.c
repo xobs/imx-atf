@@ -12,6 +12,9 @@
 #include <drivers/delay_timer.h>
 
 #include <dram.h>
+#if defined(IMX_GADGET)
+#include <imx_gadget.h>
+#endif
 
 #define IMX_SIP_DDR_DVFS_GET_FREQ_COUNT		0x10
 #define IMX_SIP_DDR_DVFS_GET_FREQ_INFO		0x11
@@ -356,10 +359,17 @@ void dram_info_init(unsigned long dram_timing_base)
 	mmio_setbits_32(REG_DDR_SDRAM_CFG_3, BIT(1));
 
 	/* Register the EL3 handler for DDR DVFS */
+#if defined(IMX_GADGET)
+	/* osdyne's USB gadget owns the EL3 handler, and passes SGI 8 on. */
+	(void)flags;
+	(void)rc;
+	imx_gadget_chain_fiq(waiting_dvfs);
+#else
 	set_interrupt_rm_flag(flags, NON_SECURE);
 	rc = register_interrupt_type_handler(INTR_TYPE_EL3, waiting_dvfs, flags);
 	if (rc)
 		panic();
+#endif
 }
 
 int dram_dvfs_handler(uint32_t smc_fid, void *handle,

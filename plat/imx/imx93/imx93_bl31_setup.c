@@ -21,10 +21,13 @@
 
 #include <ele_api.h>
 #include <dram.h>
+#include <imx_gadget.h>
 #include <imx8_lpuart.h>
 #include <plat_common.h>
 #include <plat_imx8.h>
 #include <platform_def.h>
+
+#include "imx93_chipidea.h"
 
 #define MAP_BL31_TOTAL										   \
 	MAP_REGION_FLAT(BL31_BASE, BL31_SIZE, MT_MEMORY | MT_RW | MT_SECURE)
@@ -42,6 +45,30 @@ static const mmap_region_t imx_mmap[] = {
 	TRDC_N_MAP, DDRMIX_MAP, GPIO_MAP,
 	S400_MU_MAP, NIC_GPV_MAP, AIPS3_MAP,
 	FSB_MAP,
+	/*
+	 * USB OTG1, the ChipIdea controller osdyne's gadget runs on.  Non-secure:
+	 * the TRDC opens HSIOMIX to the A55's domain for non-secure accesses
+	 * only (trdc_config.h), and a secure one stalls.
+	 */
+	MAP_REGION_FLAT(0x4c100000, 0x10000, MT_DEVICE | MT_RW | MT_NS),
+	/*
+	 * DRAM osdyne leaves to BL31, above where it runs: the gadget's queue
+	 * heads, transfer descriptors and buffers, then the console rings it
+	 * shares with osdyne. Non-cacheable, so neither the controller nor
+	 * osdyne needs cache maintenance, and non-secure, so BL31 sees the
+	 * same memory they do.
+	 */
+	MAP_REGION_FLAT(0x93300000, 0x10000, MT_NON_CACHEABLE | MT_NS | MT_RW),
+	MAP_REGION_FLAT(0x93380000, 0x10000, MT_NON_CACHEABLE | MT_NS | MT_RW),
+	/*
+	 * osdyne's DRAM, so the host can peek and poke it through the gadget,
+	 * split around the windows above.  Every access is still checked page
+	 * by page against these mappings, so only mapped ranges are touched.
+	 */
+	MAP_REGION_FLAT(0x80000000, 0x13000000, MT_MEMORY | MT_RW | MT_NS),
+	MAP_REGION_FLAT(0x93400000, 0x0cc00000, MT_MEMORY | MT_RW | MT_NS),
+	/* osdyne's part of OCRAM, below BL31. */
+	MAP_REGION_FLAT(OCRAM_BASE, BL31_BASE - OCRAM_BASE, MT_MEMORY | MT_RW | MT_NS),
 	{0},
 };
 
@@ -154,7 +181,7 @@ void bl31_platform_setup(void)
 {
 	generic_delay_timer_init();
 
-	/* get soc info */
+	/* get soc info, whose UID the gadget reports as its serial */
 	ele_get_soc_info();
 
 	/* Init the dram info */
@@ -162,6 +189,18 @@ void bl31_platform_setup(void)
 
 	plat_gic_driver_init();
 	plat_gic_init();
+
+	/* Bring up the resident USB console gadget. */
+	imx_gadget_init(IMX93_CHIPIDEA_INTID);
+
+	/* Last, so that everything a held board still has to do is set up. */
+	imx_gadget_hold_for_host();
+}
+
+/* Runs once BL33's entry context is built, just before BL31 enters it. */
+void bl31_plat_runtime_setup(void)
+{
+	imx_gadget_halt_at_entry();
 }
 
 entry_point_info_t *bl31_plat_get_next_image_ep_info(unsigned int type)

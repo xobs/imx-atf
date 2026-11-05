@@ -4,6 +4,15 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
 
+# Route external aborts and SErrors from the non-secure world to EL3 so the
+# debug monitor sees them: a crash in osdyne becomes something inspectable
+# over USB instead of a dead board.
+HANDLE_EA_EL3_FIRST_NS	:=	1
+
+# osdyne's USB gadget (plat/imx/common/imx_gadget.c), on the ChipIdea.
+IMX_GADGET		:=	1
+$(eval $(call add_define,IMX_GADGET))
+
 PLAT_INCLUDES		:=	-Iplat/imx/common/include		\
 				-Iplat/imx/imx93/include		\
 				-Iplat/imx/imx9/include		\
@@ -35,6 +44,8 @@ BL31_SOURCES		+=	common/desc_image_load.c			\
 				plat/imx/imx93/trdc.c			\
 				plat/imx/imx93/pwr_ctrl.c			\
 				plat/imx/imx93/imx93_bl31_setup.c		\
+				plat/imx/imx93/imx93_chipidea.c		\
+				plat/imx/common/imx_gadget.c			\
 				plat/imx/imx93/imx93_psci.c			\
 				plat/imx/imx93/src.c			\
 				plat/imx/common/imx_sip_svc.c			\
