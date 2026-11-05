@@ -22,7 +22,7 @@
 #include <imx_scmi_client.h>
 #include <plat_imx8.h>
 #include <scmi_imx9.h>
-#include "imx95_dwc3.h"
+#include <imx_gadget.h>
 
 #define IMR_NUM		U(12)
 #define IMX95_A55P_IDX		6
@@ -755,7 +755,7 @@ void __dead2 imx_system_reset(void)
 	 * (covers the UART-triggered reflash reset, which used to be handled by
 	 * osdyne before the gadget moved entirely into BL31).
 	 */
-	imx95_dwc3_disconnect();
+	imx_gadget_disconnect();
 
 	/* TODO: temp workaround for GIC to let reset done */
 	gicd_clr_ctlr(PLAT_GICD_BASE,

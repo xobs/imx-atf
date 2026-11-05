@@ -91,4 +91,11 @@
 #define IMX_TRUSTY_STACK_SIZE 0x200
 #define TRUSTY_SHARED_MEMORY_OBJ_SIZE (12 * 1024)
 
+/* osdyne's USB gadget (plat/imx/common/imx_gadget.c). */
+#define IMX_GADGET_CHIP			"MIMX95"
+/* The boot ROM's own PID, so that one vid:pid names the board throughout. */
+#define IMX_GADGET_PID			0x015d
+/* The console rings shared with osdyne; see the DRAM map in imx95_bl31_setup.c. */
+#define IMX_GADGET_CONSOLE_BASE		U(0x93380000)
+
 #endif /* platform_def.h */

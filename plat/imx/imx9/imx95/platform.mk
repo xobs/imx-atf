@@ -11,6 +11,10 @@ ENABLE_SCMI_SM := 1
 # over USB instead of a dead board.
 HANDLE_EA_EL3_FIRST_NS	:=	1
 
+# osdyne's USB gadget (plat/imx/common/imx_gadget.c), on the DWC3.
+IMX_GADGET		:=	1
+$(eval $(call add_define,IMX_GADGET))
+
 PLAT_INCLUDES		:=	-Iplat/imx/common/include		\
 				-Iplat/imx/imx9/common/include		\
 				-Iplat/imx/imx9/imx95/include		\
@@ -42,6 +46,7 @@ BL31_SOURCES		+=	drivers/arm/css/scmi/scmi_common.c		\
 				plat/imx/imx9/common/plat_topology.c		\
 				plat/imx/common/lpuart_console.S		\
 				plat/imx/imx9/imx95/imx95_bl31_setup.c		\
+				plat/imx/common/imx_gadget.c			\
 				plat/imx/imx9/imx95/imx95_dwc3.c		\
 				plat/imx/imx9/imx95/imx95_m7.c			\
 				plat/imx/imx9/imx95/imx95_lmm.c			\

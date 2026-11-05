@@ -13,8 +13,8 @@
 #include <tools_share/uuid.h>
 
 #include <imx_sip_svc.h>
-#if defined(PLAT_imx95)
-#include "../imx9/imx95/imx95_dwc3.h"
+#if defined(IMX_GADGET)
+#include <imx_gadget.h>
 #endif
 
 #include <ele_api.h>
@@ -37,57 +37,22 @@ static uintptr_t imx_sip_handler(unsigned int smc_fid,
 	case IMX_SIP_AARCH32:
 		SMC_RET1(handle, imx_kernel_entry_handler(smc_fid, x1, x2, x3, x4));
 		break;
-#if defined(PLAT_imx95)
+#if defined(IMX_GADGET)
 	case IMX_SIP_USB_CONSOLE: {
-		imx95_dwc3_console_kick();
+		imx_gadget_console_kick();
 		SMC_RET1(handle, 0);
 		break;
 	}
 	case IMX_SIP_DEBUG_FAULT: {
 		/*
-		 * Faults the architecture delivers to EL1 never reach EL3 on
-		 * their own, so this is osdyne's way into the same monitor that
-		 * external aborts reach by themselves.  It blocks until the
-		 * host resumes.
-		 *
-		 * Each debug class has a lower-EL and a same-EL encoding.
-		 * osdyne debugs itself, so in practice these arrive as the
-		 * same-EL form (0x31/0x33/0x35); the lower-EL ones are accepted
-		 * for a kernel that one day runs something beneath it.
-		 *
-		 * x3 is the faulting PC and x4 the physical address of the
-		 * faulting code's registers (struct dbg_frame), or 0.  The
-		 * registers saved at this SMC are osdyne's handler's, so the
-		 * frame is what the host is shown.  A payload that predates
-		 * frames leaves x4 undefined; the monitor checks it.
+		 * osdyne reporting a debug exception the architecture delivered
+		 * to EL1: x1 is ESR_EL1, x2 FAR_EL1, x3 the faulting PC and x4
+		 * the physical address of the faulting code's registers, or 0.
+		 * Blocks until the host resumes.
 		 */
-		unsigned int reason;
-		bool skip;
+		bool skip = imx_gadget_debug_fault_smc((uint64_t)x1, (uint64_t)x2,
+						       (uint64_t)x3, (uint64_t)x4);
 
-		switch ((unsigned int)((x1 >> 26) & 0x3fU)) {
-		case 0x30U:
-		case 0x31U:
-			reason = DBG_REASON_BREAKPOINT;
-			break;
-		case 0x32U:
-		case 0x33U:
-			reason = DBG_REASON_STEP;
-			break;
-		case 0x34U:
-		case 0x35U:
-			reason = DBG_REASON_WATCHPOINT;
-			break;
-		case 0x3cU:
-			reason = DBG_REASON_BRK;
-			break;
-		default:
-			reason = DBG_REASON_PAYLOAD;
-			break;
-		}
-
-		skip = imx95_dwc3_debug_fault(reason, NULL, (uint64_t)x1,
-					      (uint64_t)x2, (uint64_t)x3,
-					      (uint64_t)x4);
 		SMC_RET2(handle, 0, skip ? 1UL : 0UL);
 		break;
 	}

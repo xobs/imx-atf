@@ -10,7 +10,7 @@
 /* SMC function IDs for SiP Service queries */
 #define IMX_SIP_GPC			0xC2000000
 
-/* i.MX95: kick BL31's resident USB console gadget to drain its TX ring. */
+/* Kick BL31's resident USB console gadget (imx_gadget.h) to drain its TX ring. */
 #define IMX_SIP_USB_CONSOLE		0xC2000100
 /*
  * osdyne's own exception vector reports a fault the architecture delivered to

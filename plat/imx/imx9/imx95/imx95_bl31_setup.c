@@ -27,8 +27,7 @@
 #include <drivers/arm/gicv3.h>
 #include "../drivers/arm/gic/v3/gicv3_private.h"
 
-#include <bl31/ea_handle.h>
-#include <bl31/interrupt_mgmt.h>
+#include <imx_gadget.h>
 #include "imx95_dwc3.h"
 
 #define TRUSTY_PARAMS_LEN_BYTES      (4096*2)
@@ -169,114 +168,10 @@ void bl31_plat_arch_setup(void)
 	enable_mmu_el3(0);
 }
 
-/*
- * EL3 FIQ handler for the DWC3 controller (INTID 207, Group-0 secure). Runs the
- * resident USB console gadget, preempting EL1/EL2 unconditionally.
- */
-static uint64_t imx95_dwc3_fiq_handler(uint32_t id, uint32_t flags,
-				       void *handle, void *cookie)
-{
-	uint32_t irq = plat_ic_acknowledge_interrupt();
-
-	if (irq == IMX95_DWC3_INTID) {
-		/*
-		 * TF-A hands us the context of whatever it interrupted, which
-		 * for our purposes is the debuggee.  Remember it so the host
-		 * can read its PC and registers.
-		 */
-		imx95_dwc3_debug_context(handle);
-
-		imx95_dwc3_service();
-
-		/*
-		 * Park if the host has asked us to stop.  End-of-interrupt is
-		 * deliberately still outstanding, which keeps the GIC priority
-		 * masked so no nested FIQ re-enters the monitor.
-		 */
-		imx95_dwc3_debug_park();
-	}
-
-	if (irq < 1022U)
-		plat_ic_end_of_interrupt(irq);
-
-	return 0;
-}
-
-/*
- * With HANDLE_EA_EL3_FIRST_NS, SCR_EL3.EA routes external aborts and SErrors
- * from the non-secure world to EL3 instead of to osdyne.  TF-A's default
- * handler prints and panics, which leaves a dead board.  Park in the USB
- * monitor instead, so the crash can be inspected over the same pipe that
- * carries the console.
- */
-void plat_ea_handler(unsigned int ea_reason, uint64_t syndrome, void *cookie,
-		     void *handle, uint64_t flags)
-{
-	unsigned int reason;
-	uint64_t far = 0U;
-
-	(void)cookie;
-	(void)flags;
-
-	if (!imx95_dwc3_debug_ready()) {
-		/* No monitor to park in yet: die the way TF-A would have. */
-		plat_default_ea_handler(ea_reason, syndrome, cookie, handle,
-					flags);
-		return;
-	}
-
-	if (ea_reason == ERROR_EA_ASYNC) {
-		/* SError: asynchronous, so FAR_EL3 means nothing. */
-		reason = DBG_REASON_EA_ASYNC;
-	} else {
-		reason = DBG_REASON_EA_SYNC;
-		far = read_far_el3();
-	}
-
-	ERROR("dwc3(el3): external abort (reason %u, esr 0x%llx) -- parking in the debug monitor\n",
-	      ea_reason, (unsigned long long)syndrome);
-
-	/*
-	 * Returning resumes the faulting instruction, which will simply abort
-	 * again -- so honour a host "resume --skip" by stepping over it.  The
-	 * abort was synchronous and precise, so ELR_EL3 is the aborting
-	 * instruction and A64 instructions are all four bytes.
-	 */
-	if (imx95_dwc3_debug_fault(reason, handle, syndrome, far, 0U, 0U) &&
-	    (reason == DBG_REASON_EA_SYNC)) {
-		el3_state_t *st = get_el3state_ctx(handle);
-
-		write_ctx_reg(st, CTX_ELR_EL3,
-			      read_ctx_reg(st, CTX_ELR_EL3) + 4U);
-	}
-}
-
-/*
- * A BL31 panic is normally a silently dead board: no console, no reset, and
- * nothing left to ask.  The gadget is serviced by polling, so it can still run
- * here; park and let the host look at whatever osdyne was doing.
- */
-void __dead2 plat_panic_handler(void)
-{
-	while (imx95_dwc3_debug_ready()) {
-		(void)imx95_dwc3_debug_fault(DBG_REASON_EL3_PANIC, NULL,
-					     0U, 0U, 0U, 0U);
-	}
-
-	/* Panicked before the gadget came up; nothing can be inspected. */
-	imx_system_reset();
-
-	while (true) {
-	}
-}
-
 void bl31_platform_setup(void)
 {
 	uint32_t gicr_ctlr;
 	uintptr_t gicr_base;
-	uint32_t flags;
-	unsigned int cpu;
-	int rc;
 	int i;
 
 	generic_delay_timer_init();
@@ -311,45 +206,14 @@ void bl31_platform_setup(void)
 	write_icc_igrpen1_el3(read_icc_igrpen1_el3() |
 			      IGRPEN1_EL3_ENABLE_G1NS_BIT);
 
-	/*
-	 * Carve the DWC3 controller interrupt (INTID 207) back out of the
-	 * blanket Group1NS routing above and make it a Group-0 secure FIQ to
-	 * EL3, so BL31's resident USB console gadget services it even while
-	 * EL1/EL2 is CPU-bound or hung.
-	 */
-	cpu = plat_my_core_pos();
-	gicv3_set_interrupt_group(IMX95_DWC3_INTID, cpu, INTR_GROUP0);
-	gicv3_set_interrupt_priority(IMX95_DWC3_INTID, cpu,
-				     GIC_HIGHEST_SEC_PRIORITY);
-
-	/*
-	 * On a warm (SCMI) reset the GIC distributor is NOT reset, so INTID 207
-	 * can be left stuck in the Active state from the previous boot's DWC3
-	 * FIQ. gicv3_distif_init() clears enable/pending but not Active, and the
-	 * GIC never re-delivers an already-Active interrupt — so the console FIQ
-	 * fires on a cold boot but never on a warm one. Clear both Pending and
-	 * Active for 207 before enabling it. (207 is an SPI, so its Active state
-	 * lives in the distributor: GICD_ICACTIVER.)
-	 */
-	gicv3_clear_interrupt_pending(IMX95_DWC3_INTID, cpu);
-	mmio_write_32(PLAT_GICD_BASE + GICD_ICACTIVER +
-			      (IMX95_DWC3_INTID / 32) * 4,
-		      1U << (IMX95_DWC3_INTID % 32));
-
-	gicv3_enable_interrupt(IMX95_DWC3_INTID, cpu);
-
-	flags = 0;
-	set_interrupt_rm_flag(flags, NON_SECURE);
-	rc = register_interrupt_type_handler(INTR_TYPE_EL3,
-					     imx95_dwc3_fiq_handler, flags);
-	if (rc != 0)
-		panic();
-
 	/* get soc info, whose UID the gadget reports as its serial */
 	ele_get_soc_info();
 
-	/* Bring up the resident USB console gadget. */
-	imx95_dwc3_gadget_init();
+	/*
+	 * Bring up the resident USB console gadget, its interrupt carved back
+	 * out of the blanket Group1NS routing above as a Group-0 FIQ to EL3.
+	 */
+	imx_gadget_init(IMX95_DWC3_INTID);
 
 	plat_imx9_scmi_setup();
 
@@ -357,13 +221,13 @@ void bl31_platform_setup(void)
 	 * Last, so that everything a held board still has to do -- a reboot
 	 * request goes through SCMI -- is already set up.
 	 */
-	imx95_dwc3_hold_for_host();
+	imx_gadget_hold_for_host();
 }
 
 /* Runs once BL33's entry context is built, just before BL31 enters it. */
 void bl31_plat_runtime_setup(void)
 {
-	imx95_dwc3_halt_at_entry();
+	imx_gadget_halt_at_entry();
 }
 
 entry_point_info_t *bl31_plat_get_next_image_ep_info(unsigned int type)
