@@ -35,7 +35,7 @@
 /* ------------------------------------------------------------------ bases */
 
 #define USB_BASE	U(0x4c100000)	/* USB OTG1 */
-#define DMA_MEM_BASE	U(0x93300000)
+#define DMA_MEM_BASE	U(0xfff00000)
 
 /* The controller's clock gate, CCGR_USBC. */
 #define LPCG_USBC	104U

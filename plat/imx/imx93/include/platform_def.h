@@ -51,8 +51,8 @@
 #define PLAT_PHY_ADDR_SPACE_SIZE	(ULL(1) << 32)
 
 /*
- * osdyne's USB gadget adds six regions (imx93_bl31_setup.c), and the tables
- * for the first GiB of DRAM, the gadget's windows and the USB controller.
+ * osdyne's USB gadget adds five regions (imx93_bl31_setup.c), and the tables
+ * for the top GiB of DRAM, the gadget's windows and the USB controller.
  */
 #ifdef SPD_trusty
 #define MAX_XLAT_TABLES			21
@@ -139,6 +139,6 @@
 /* The boot ROM's own PID, so that one vid:pid names the board throughout. */
 #define IMX_GADGET_PID			0x014e
 /* The console rings shared with osdyne; see the DRAM map in imx93_bl31_setup.c. */
-#define IMX_GADGET_CONSOLE_BASE		U(0x93380000)
+#define IMX_GADGET_CONSOLE_BASE		U(0xfff80000)
 
 #endif /* platform_def.h */

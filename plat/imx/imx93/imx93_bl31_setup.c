@@ -52,21 +52,20 @@ static const mmap_region_t imx_mmap[] = {
 	 */
 	MAP_REGION_FLAT(0x4c100000, 0x10000, MT_DEVICE | MT_RW | MT_NS),
 	/*
-	 * DRAM osdyne leaves to BL31, above where it runs: the gadget's queue
+	 * The top MiB of DRAM, which osdyne leaves to BL31: the gadget's queue
 	 * heads, transfer descriptors and buffers, then the console rings it
 	 * shares with osdyne. Non-cacheable, so neither the controller nor
 	 * osdyne needs cache maintenance, and non-secure, so BL31 sees the
 	 * same memory they do.
 	 */
-	MAP_REGION_FLAT(0x93300000, 0x10000, MT_NON_CACHEABLE | MT_NS | MT_RW),
-	MAP_REGION_FLAT(0x93380000, 0x10000, MT_NON_CACHEABLE | MT_NS | MT_RW),
+	MAP_REGION_FLAT(0xfff00000, 0x10000, MT_NON_CACHEABLE | MT_NS | MT_RW),
+	MAP_REGION_FLAT(0xfff80000, 0x10000, MT_NON_CACHEABLE | MT_NS | MT_RW),
 	/*
-	 * osdyne's DRAM, so the host can peek and poke it through the gadget,
-	 * split around the windows above.  Every access is still checked page
-	 * by page against these mappings, so only mapped ranges are touched.
+	 * osdyne's DRAM, everything below the windows, so the host can peek and
+	 * poke it through the gadget.  Every access is still checked page by
+	 * page against these mappings, so only mapped ranges are touched.
 	 */
-	MAP_REGION_FLAT(0x80000000, 0x13000000, MT_MEMORY | MT_RW | MT_NS),
-	MAP_REGION_FLAT(0x93400000, 0x0cc00000, MT_MEMORY | MT_RW | MT_NS),
+	MAP_REGION_FLAT(0x80000000, 0x7ff00000, MT_MEMORY | MT_RW | MT_NS),
 	/* osdyne's part of OCRAM, below BL31. */
 	MAP_REGION_FLAT(OCRAM_BASE, BL31_BASE - OCRAM_BASE, MT_MEMORY | MT_RW | MT_NS),
 	{0},
